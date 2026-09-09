@@ -1,0 +1,230 @@
+[
+  {
+    "source": "arn:aws:iam::123456789012:user/alice-dev",
+    "destination": "arn:aws:iam::123456789012:role/ShadowAdminRole",
+    "reason": "can assume role ShadowAdminRole via sts:AssumeRole (trusted in role's trust policy)",
+    "short_reason": "sts:AssumeRole"
+  },
+  {
+    "source": "arn:aws:iam::123456789012:user/charlie-devops",
+    "destination": "arn:aws:iam::123456789012:role/ShadowAdminRole",
+    "reason": "can assume role ShadowAdminRole via sts:AssumeRole (trusted in role's trust policy)",
+    "short_reason": "sts:AssumeRole"
+  },
+  {
+    "source": "arn:aws:iam::123456789012:role/ShadowAdminRole",
+    "destination": "arn:aws:iam::123456789012:role/AdminRole",
+    "reason": "can attach AdministratorAccess policy via iam:AttachRolePolicy to AdminRole",
+    "short_reason": "iam:AttachRolePolicy"
+  },
+  {
+    "source": "arn:aws:iam::123456789012:role/ShadowAdminRole",
+    "destination": "arn:aws:iam::123456789012:user/admin-user",
+    "reason": "can create access keys for admin-user via iam:CreateAccessKey",
+    "short_reason": "iam:CreateAccessKey"
+  },
+  {
+    "source": "arn:aws:iam::123456789012:user/jenkins-ci",
+    "destination": "arn:aws:iam::123456789012:role/LambdaExecutionRole",
+    "reason": "can create Lambda function with role LambdaExecutionRole via lambda:CreateFunction and iam:PassRole",
+    "short_reason": "lambda:CreateFunction + iam:PassRole"
+  },
+  {
+    "source": "arn:aws:iam::123456789012:user/jenkins-ci",
+    "destination": "arn:aws:iam::123456789012:role/LambdaAdminRole",
+    "reason": "can create Lambda function with role LambdaAdminRole via lambda:CreateFunction and iam:PassRole",
+    "short_reason": "lambda:CreateFunction + iam:PassRole"
+  },
+  {
+    "source": "arn:aws:iam::123456789012:role/LambdaExecutionRole",
+    "destination": "arn:aws:iam::123456789012:role/AdminRole",
+    "reason": "can retrieve admin credentials from Secrets Manager via secretsmanager:GetSecretValue",
+    "short_reason": "secretsmanager:GetSecretValue"
+  },
+  {
+    "source": "arn:aws:iam::123456789012:user/terraform-deploy",
+    "destination": "arn:aws:iam::123456789012:role/CloudFormationRole",
+    "reason": "can create CloudFormation stack with role CloudFormationRole via cloudformation:CreateStack and iam:PassRole",
+    "short_reason": "cloudformation:CreateStack + iam:PassRole"
+  },
+  {
+    "source": "arn:aws:iam::123456789012:user/terraform-deploy",
+    "destination": "arn:aws:iam::123456789012:role/EC2AdminRole",
+    "reason": "can run EC2 instances with role EC2AdminRole via ec2:RunInstances and iam:PassRole",
+    "short_reason": "ec2:RunInstances + iam:PassRole"
+  },
+  {
+    "source": "arn:aws:iam::123456789012:user/github-actions",
+    "destination": "arn:aws:iam::123456789012:role/CodeBuildServiceRole",
+    "reason": "can create CodeBuild project with role CodeBuildServiceRole via codebuild:CreateProject and iam:PassRole",
+    "short_reason": "codebuild:CreateProject + iam:PassRole"
+  },
+  {
+    "source": "arn:aws:iam::123456789012:role/CodeBuildServiceRole",
+    "destination": "arn:aws:iam::123456789012:role/AdminRole",
+    "reason": "can assume AdminRole via sts:AssumeRole from CodeBuild execution context",
+    "short_reason": "sts:AssumeRole"
+  },
+  {
+    "source": "arn:aws:iam::123456789012:user/charlie-devops",
+    "destination": "arn:aws:iam::123456789012:role/EC2InstanceRole",
+    "reason": "can run EC2 instances with role EC2InstanceRole via ec2:RunInstances and iam:PassRole",
+    "short_reason": "ec2:RunInstances + iam:PassRole"
+  },
+  {
+    "source": "arn:aws:iam::123456789012:role/EC2InstanceRole",
+    "destination": "arn:aws:iam::123456789012:role/EC2AdminRole",
+    "reason": "can run nested EC2 instance with EC2AdminRole via ec2:RunInstances and iam:PassRole",
+    "short_reason": "ec2:RunInstances + iam:PassRole"
+  },
+  {
+    "source": "arn:aws:iam::123456789012:user/eve-datascience",
+    "destination": "arn:aws:iam::123456789012:role/SageMakerExecutionRole",
+    "reason": "can create SageMaker notebook with role SageMakerExecutionRole via sagemaker:CreateNotebookInstance and iam:PassRole",
+    "short_reason": "sagemaker:CreateNotebookInstance + iam:PassRole"
+  },
+  {
+    "source": "arn:aws:iam::123456789012:role/SageMakerExecutionRole",
+    "destination": "arn:aws:iam::123456789012:role/AdminRole",
+    "reason": "can access S3 bucket containing admin credentials via s3:GetObject",
+    "short_reason": "s3:GetObject (credentials in S3)"
+  },
+  {
+    "source": "arn:aws:iam::123456789012:user/eve-datascience",
+    "destination": "arn:aws:iam::123456789012:role/GlueServiceRole",
+    "reason": "can create Glue job with role GlueServiceRole via glue:CreateJob and iam:PassRole",
+    "short_reason": "glue:CreateJob + iam:PassRole"
+  },
+  {
+    "source": "arn:aws:iam::123456789012:role/GlueServiceRole",
+    "destination": "arn:aws:iam::123456789012:role/LambdaExecutionRole",
+    "reason": "can invoke Lambda function with LambdaExecutionRole via lambda:InvokeFunction",
+    "short_reason": "lambda:InvokeFunction"
+  },
+  {
+    "source": "arn:aws:iam::123456789012:user/bob-dev",
+    "destination": "arn:aws:iam::123456789012:role/CodePipelineRole",
+    "reason": "can start CodePipeline execution that uses CodePipelineRole",
+    "short_reason": "codepipeline:StartPipelineExecution"
+  },
+  {
+    "source": "arn:aws:iam::123456789012:role/CodePipelineRole",
+    "destination": "arn:aws:iam::123456789012:role/CloudFormationRole",
+    "reason": "can create CloudFormation stack with admin role CloudFormationRole",
+    "short_reason": "cloudformation:CreateStack + iam:PassRole"
+  },
+  {
+    "source": "arn:aws:iam::123456789012:user/david-contractor",
+    "destination": "arn:aws:iam::123456789012:role/ECSTaskRole",
+    "reason": "can run ECS task with role ECSTaskRole via ecs:RunTask and iam:PassRole",
+    "short_reason": "ecs:RunTask + iam:PassRole"
+  },
+  {
+    "source": "arn:aws:iam::123456789012:role/ECSTaskRole",
+    "destination": "arn:aws:iam::123456789012:role/LambdaExecutionRole",
+    "reason": "can read SSM parameters containing Lambda credentials via ssm:GetParameter",
+    "short_reason": "ssm:GetParameter"
+  },
+  {
+    "source": "arn:aws:iam::123456789012:user/alice-dev",
+    "destination": "arn:aws:iam::123456789012:user/bob-dev",
+    "reason": "can create access keys for bob-dev via iam:CreateAccessKey",
+    "short_reason": "iam:CreateAccessKey"
+  },
+  {
+    "source": "arn:aws:iam::123456789012:user/charlie-devops",
+    "destination": "arn:aws:iam::123456789012:role/StepFunctionsRole",
+    "reason": "can create Step Functions state machine with role StepFunctionsRole",
+    "short_reason": "states:CreateStateMachine + iam:PassRole"
+  },
+  {
+    "source": "arn:aws:iam::123456789012:role/StepFunctionsRole",
+    "destination": "arn:aws:iam::123456789012:role/LambdaAdminRole",
+    "reason": "can invoke Lambda with LambdaAdminRole via states execution",
+    "short_reason": "lambda:InvokeFunction"
+  },
+  {
+    "source": "arn:aws:iam::123456789012:role/CrossAccountAuditRole",
+    "destination": "arn:aws:iam::123456789012:role/AdminRole",
+    "reason": "can assume AdminRole from external account 999888777666 via sts:AssumeRole (no ExternalId required)",
+    "short_reason": "sts:AssumeRole (cross-account)"
+  },
+  {
+    "source": "arn:aws:iam::123456789012:user/security-admin",
+    "destination": "arn:aws:iam::123456789012:role/CrossAccountAuditRole",
+    "reason": "can update assume role policy to add themselves as trusted via iam:UpdateAssumeRolePolicy",
+    "short_reason": "iam:UpdateAssumeRolePolicy"
+  },
+  {
+    "source": "arn:aws:iam::123456789012:user/jenkins-ci",
+    "destination": "arn:aws:iam::123456789012:role/EC2InstanceRole",
+    "reason": "can run EC2 instances with role EC2InstanceRole via ec2:RunInstances and iam:PassRole",
+    "short_reason": "ec2:RunInstances + iam:PassRole"
+  },
+  {
+    "source": "arn:aws:iam::123456789012:role/DataPipelineRole",
+    "destination": "arn:aws:iam::123456789012:role/EC2AdminRole",
+    "reason": "can launch EC2 with admin role via Data Pipeline activity",
+    "short_reason": "ec2:RunInstances + iam:PassRole"
+  },
+  {
+    "source": "arn:aws:iam::123456789012:user/eve-datascience",
+    "destination": "arn:aws:iam::123456789012:role/DataPipelineRole",
+    "reason": "can create Data Pipeline with role DataPipelineRole via datapipeline:CreatePipeline",
+    "short_reason": "datapipeline:CreatePipeline + iam:PassRole"
+  },
+  {
+    "source": "arn:aws:iam::123456789012:user/frank-support",
+    "destination": "arn:aws:iam::123456789012:role/VendorIntegrationRole",
+    "reason": "can read SSM parameters to extract ExternalId for VendorIntegrationRole",
+    "short_reason": "ssm:GetParameter (ExternalId)"
+  },
+  {
+    "source": "arn:aws:iam::123456789012:role/VendorIntegrationRole",
+    "destination": "arn:aws:iam::123456789012:role/LambdaExecutionRole",
+    "reason": "can update Lambda function code for functions using LambdaExecutionRole",
+    "short_reason": "lambda:UpdateFunctionCode"
+  },
+  {
+    "source": "arn:aws:iam::123456789012:user/sysops-user",
+    "destination": "arn:aws:iam::123456789012:role/AutoScalingRole",
+    "reason": "can create AutoScaling group with launch configuration using AutoScalingRole via autoscaling:CreateAutoScalingGroup and iam:PassRole",
+    "short_reason": "autoscaling:CreateAutoScalingGroup + iam:PassRole"
+  },
+  {
+    "source": "arn:aws:iam::123456789012:user/sysops-user",
+    "destination": "arn:aws:iam::123456789012:role/SSMSessionRole",
+    "reason": "can execute commands on EC2 instances with SSMSessionRole via ssm:SendCommand",
+    "short_reason": "ssm:SendCommand"
+  },
+  {
+    "source": "arn:aws:iam::123456789012:user/sysops-user",
+    "destination": "arn:aws:iam::123456789012:role/EC2AdminRole",
+    "reason": "can start SSM session on EC2 instances running EC2AdminRole via ssm:StartSession",
+    "short_reason": "ssm:StartSession"
+  },
+  {
+    "source": "arn:aws:iam::123456789012:role/WildcardTrustRole",
+    "destination": "arn:aws:iam::123456789012:role/AdminRole",
+    "reason": "any AWS principal can assume this role due to wildcard trust Principal: * without conditions",
+    "short_reason": "sts:AssumeRole (Wildcard)"
+  },
+  {
+    "source": "arn:aws:iam::123456789012:user/alice-dev",
+    "destination": "arn:aws:iam::123456789012:role/CodeBuildServiceRole",
+    "reason": "can create CodeBuild project with role CodeBuildServiceRole via codebuild:CreateProject and iam:PassRole",
+    "short_reason": "codebuild:CreateProject + iam:PassRole"
+  },
+  {
+    "source": "arn:aws:iam::123456789012:user/bob-dev",
+    "destination": "arn:aws:iam::123456789012:user/charlie-devops",
+    "reason": "can create access keys for charlie-devops via iam:CreateAccessKey",
+    "short_reason": "iam:CreateAccessKey"
+  },
+  {
+    "source": "arn:aws:iam::123456789012:role/SageMakerExecutionRole",
+    "destination": "arn:aws:iam::123456789012:role/LambdaAdminRole",
+    "reason": "can assume LambdaAdminRole from SageMaker notebook via sts:AssumeRole (debug permissions)",
+    "short_reason": "sts:AssumeRole"
+  }
+]

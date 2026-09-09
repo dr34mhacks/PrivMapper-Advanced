@@ -1,0 +1,432 @@
+[
+  {
+    "arn": "arn:aws:iam::123456789012:user/admin-user",
+    "id_value": "AIDAEXAMPLE11111",
+    "attached_policies": ["arn:aws:iam::aws:policy/AdministratorAccess"],
+    "group_memberships": ["Admins"],
+    "trust_policy": null,
+    "instance_profile": null,
+    "num_access_keys": 1,
+    "active_password": true,
+    "is_admin": true,
+    "has_mfa": true,
+    "tags": {"Environment": "Production", "Team": "Platform"}
+  },
+  {
+    "arn": "arn:aws:iam::123456789012:user/security-admin",
+    "id_value": "AIDAEXAMPLE11112",
+    "attached_policies": ["arn:aws:iam::aws:policy/SecurityAudit", "arn:aws:iam::123456789012:policy/SecurityTeamPolicy"],
+    "group_memberships": ["SecurityTeam"],
+    "trust_policy": null,
+    "num_access_keys": 1,
+    "active_password": true,
+    "is_admin": false,
+    "has_mfa": true,
+    "tags": {"Team": "Security"}
+  },
+  {
+    "arn": "arn:aws:iam::123456789012:user/alice-dev",
+    "id_value": "AIDAEXAMPLE22222",
+    "attached_policies": ["arn:aws:iam::123456789012:policy/DeveloperPolicy"],
+    "group_memberships": ["Developers", "CodeCommitUsers"],
+    "trust_policy": null,
+    "num_access_keys": 2,
+    "active_password": true,
+    "is_admin": false,
+    "has_mfa": false,
+    "tags": {"Team": "Engineering", "Project": "Phoenix"}
+  },
+  {
+    "arn": "arn:aws:iam::123456789012:user/bob-dev",
+    "id_value": "AIDAEXAMPLE22223",
+    "attached_policies": ["arn:aws:iam::123456789012:policy/DeveloperPolicy"],
+    "group_memberships": ["Developers"],
+    "trust_policy": null,
+    "num_access_keys": 1,
+    "active_password": true,
+    "is_admin": false,
+    "has_mfa": false,
+    "tags": {"Team": "Engineering", "Project": "Phoenix"}
+  },
+  {
+    "arn": "arn:aws:iam::123456789012:user/charlie-devops",
+    "id_value": "AIDAEXAMPLE33333",
+    "attached_policies": ["arn:aws:iam::123456789012:policy/DevOpsPolicy"],
+    "group_memberships": ["DevOps", "Developers"],
+    "trust_policy": null,
+    "num_access_keys": 2,
+    "active_password": true,
+    "is_admin": false,
+    "has_mfa": true,
+    "tags": {"Team": "DevOps"}
+  },
+  {
+    "arn": "arn:aws:iam::123456789012:user/david-contractor",
+    "id_value": "AIDAEXAMPLE44444",
+    "attached_policies": ["arn:aws:iam::123456789012:policy/ContractorLimitedAccess"],
+    "group_memberships": ["Contractors"],
+    "trust_policy": null,
+    "num_access_keys": 1,
+    "active_password": true,
+    "is_admin": false,
+    "has_mfa": false,
+    "tags": {"Team": "External", "Contract": "2024-Q1"}
+  },
+  {
+    "arn": "arn:aws:iam::123456789012:user/eve-datascience",
+    "id_value": "AIDAEXAMPLE55555",
+    "attached_policies": ["arn:aws:iam::123456789012:policy/DataSciencePolicy"],
+    "group_memberships": ["DataScience", "S3ReadOnly"],
+    "trust_policy": null,
+    "num_access_keys": 1,
+    "active_password": true,
+    "is_admin": false,
+    "has_mfa": false,
+    "tags": {"Team": "Data", "Project": "ML-Pipeline"}
+  },
+  {
+    "arn": "arn:aws:iam::123456789012:user/frank-support",
+    "id_value": "AIDAEXAMPLE55556",
+    "attached_policies": ["arn:aws:iam::aws:policy/ReadOnlyAccess"],
+    "group_memberships": ["Support"],
+    "trust_policy": null,
+    "num_access_keys": 0,
+    "active_password": true,
+    "is_admin": false,
+    "has_mfa": false,
+    "tags": {"Team": "Support"}
+  },
+  {
+    "arn": "arn:aws:iam::123456789012:user/jenkins-ci",
+    "id_value": "AIDAEXAMPLE66666",
+    "attached_policies": ["arn:aws:iam::123456789012:policy/JenkinsCIPolicy"],
+    "group_memberships": [],
+    "trust_policy": null,
+    "num_access_keys": 1,
+    "active_password": false,
+    "is_admin": false,
+    "has_mfa": false,
+    "tags": {"Service": "Jenkins", "Type": "ServiceAccount"}
+  },
+  {
+    "arn": "arn:aws:iam::123456789012:user/terraform-deploy",
+    "id_value": "AIDAEXAMPLE66667",
+    "attached_policies": ["arn:aws:iam::123456789012:policy/TerraformDeployPolicy"],
+    "group_memberships": [],
+    "trust_policy": null,
+    "num_access_keys": 1,
+    "active_password": false,
+    "is_admin": false,
+    "has_mfa": false,
+    "tags": {"Service": "Terraform", "Type": "ServiceAccount"}
+  },
+  {
+    "arn": "arn:aws:iam::123456789012:user/github-actions",
+    "id_value": "AIDAEXAMPLE66668",
+    "attached_policies": ["arn:aws:iam::123456789012:policy/GitHubActionsPolicy"],
+    "group_memberships": [],
+    "trust_policy": null,
+    "num_access_keys": 1,
+    "active_password": false,
+    "is_admin": false,
+    "has_mfa": false,
+    "tags": {"Service": "GitHubActions", "Type": "ServiceAccount"}
+  },
+  {
+    "arn": "arn:aws:iam::123456789012:role/AdminRole",
+    "id_value": "AROAEXAMPLE77777",
+    "attached_policies": ["arn:aws:iam::aws:policy/AdministratorAccess"],
+    "group_memberships": [],
+    "trust_policy": {
+      "Version": "2012-10-17",
+      "Statement": [{"Effect": "Allow", "Principal": {"AWS": "arn:aws:iam::123456789012:root"}, "Action": "sts:AssumeRole"}]
+    },
+    "is_admin": true,
+    "tags": {}
+  },
+  {
+    "arn": "arn:aws:iam::123456789012:role/PowerUserRole",
+    "id_value": "AROAEXAMPLE77778",
+    "attached_policies": ["arn:aws:iam::aws:policy/PowerUserAccess"],
+    "group_memberships": [],
+    "trust_policy": {
+      "Version": "2012-10-17",
+      "Statement": [{"Effect": "Allow", "Principal": {"AWS": "arn:aws:iam::123456789012:root"}, "Action": "sts:AssumeRole"}]
+    },
+    "is_admin": false,
+    "tags": {}
+  },
+  {
+    "arn": "arn:aws:iam::123456789012:role/LambdaExecutionRole",
+    "id_value": "AROAEXAMPLE88888",
+    "attached_policies": [
+      "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole",
+      "arn:aws:iam::123456789012:policy/LambdaSecretsAccess"
+    ],
+    "group_memberships": [],
+    "trust_policy": {
+      "Version": "2012-10-17",
+      "Statement": [{"Effect": "Allow", "Principal": {"Service": "lambda.amazonaws.com"}, "Action": "sts:AssumeRole"}]
+    },
+    "is_admin": false,
+    "tags": {}
+  },
+  {
+    "arn": "arn:aws:iam::123456789012:role/LambdaAdminRole",
+    "id_value": "AROAEXAMPLE88889",
+    "attached_policies": ["arn:aws:iam::aws:policy/AdministratorAccess"],
+    "group_memberships": [],
+    "trust_policy": {
+      "Version": "2012-10-17",
+      "Statement": [{"Effect": "Allow", "Principal": {"Service": "lambda.amazonaws.com"}, "Action": "sts:AssumeRole"}]
+    },
+    "is_admin": true,
+    "tags": {"Purpose": "Emergency Lambda Admin"}
+  },
+  {
+    "arn": "arn:aws:iam::123456789012:role/EC2InstanceRole",
+    "id_value": "AROAEXAMPLE99999",
+    "attached_policies": ["arn:aws:iam::123456789012:policy/EC2InstancePolicy"],
+    "group_memberships": [],
+    "trust_policy": {
+      "Version": "2012-10-17",
+      "Statement": [{"Effect": "Allow", "Principal": {"Service": "ec2.amazonaws.com"}, "Action": "sts:AssumeRole"}]
+    },
+    "instance_profile": ["arn:aws:iam::123456789012:instance-profile/EC2InstanceRole"],
+    "is_admin": false,
+    "tags": {}
+  },
+  {
+    "arn": "arn:aws:iam::123456789012:role/EC2AdminRole",
+    "id_value": "AROAEXAMPLEAAAAA",
+    "attached_policies": ["arn:aws:iam::aws:policy/AdministratorAccess"],
+    "group_memberships": [],
+    "trust_policy": {
+      "Version": "2012-10-17",
+      "Statement": [{"Effect": "Allow", "Principal": {"Service": "ec2.amazonaws.com"}, "Action": "sts:AssumeRole"}]
+    },
+    "instance_profile": ["arn:aws:iam::123456789012:instance-profile/EC2AdminRole"],
+    "is_admin": true,
+    "tags": {"Purpose": "Bastion Admin"}
+  },
+  {
+    "arn": "arn:aws:iam::123456789012:role/CodeBuildServiceRole",
+    "id_value": "AROAEXAMPLEBBBBB",
+    "attached_policies": ["arn:aws:iam::123456789012:policy/CodeBuildPolicy"],
+    "group_memberships": [],
+    "trust_policy": {
+      "Version": "2012-10-17",
+      "Statement": [{"Effect": "Allow", "Principal": {"Service": "codebuild.amazonaws.com"}, "Action": "sts:AssumeRole"}]
+    },
+    "is_admin": false,
+    "tags": {}
+  },
+  {
+    "arn": "arn:aws:iam::123456789012:role/CodePipelineRole",
+    "id_value": "AROAEXAMPLECCCCC",
+    "attached_policies": ["arn:aws:iam::123456789012:policy/CodePipelinePolicy"],
+    "group_memberships": [],
+    "trust_policy": {
+      "Version": "2012-10-17",
+      "Statement": [{"Effect": "Allow", "Principal": {"Service": "codepipeline.amazonaws.com"}, "Action": "sts:AssumeRole"}]
+    },
+    "is_admin": false,
+    "tags": {}
+  },
+  {
+    "arn": "arn:aws:iam::123456789012:role/GlueServiceRole",
+    "id_value": "AROAEXAMPLEDDDDD",
+    "attached_policies": ["arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole", "arn:aws:iam::123456789012:policy/GlueS3Access"],
+    "group_memberships": [],
+    "trust_policy": {
+      "Version": "2012-10-17",
+      "Statement": [{"Effect": "Allow", "Principal": {"Service": "glue.amazonaws.com"}, "Action": "sts:AssumeRole"}]
+    },
+    "is_admin": false,
+    "tags": {}
+  },
+  {
+    "arn": "arn:aws:iam::123456789012:role/SageMakerExecutionRole",
+    "id_value": "AROAEXAMPLEEEEEE",
+    "attached_policies": ["arn:aws:iam::aws:policy/AmazonSageMakerFullAccess", "arn:aws:iam::123456789012:policy/SageMakerS3Access"],
+    "group_memberships": [],
+    "trust_policy": {
+      "Version": "2012-10-17",
+      "Statement": [{"Effect": "Allow", "Principal": {"Service": "sagemaker.amazonaws.com"}, "Action": "sts:AssumeRole"}]
+    },
+    "is_admin": false,
+    "tags": {}
+  },
+  {
+    "arn": "arn:aws:iam::123456789012:role/ECSTaskRole",
+    "id_value": "AROAEXAMPLEFFFFF",
+    "attached_policies": ["arn:aws:iam::123456789012:policy/ECSTaskPolicy"],
+    "group_memberships": [],
+    "trust_policy": {
+      "Version": "2012-10-17",
+      "Statement": [{"Effect": "Allow", "Principal": {"Service": "ecs-tasks.amazonaws.com"}, "Action": "sts:AssumeRole"}]
+    },
+    "is_admin": false,
+    "tags": {}
+  },
+  {
+    "arn": "arn:aws:iam::123456789012:role/ShadowAdminRole",
+    "id_value": "AROAEXAMPLEGGGGG",
+    "attached_policies": ["arn:aws:iam::123456789012:policy/ShadowAdminPolicy"],
+    "group_memberships": [],
+    "trust_policy": {
+      "Version": "2012-10-17",
+      "Statement": [
+        {"Effect": "Allow", "Principal": {"AWS": "arn:aws:iam::123456789012:user/charlie-devops"}, "Action": "sts:AssumeRole"},
+        {"Effect": "Allow", "Principal": {"AWS": "arn:aws:iam::123456789012:user/alice-dev"}, "Action": "sts:AssumeRole"}
+      ]
+    },
+    "is_admin": false,
+    "tags": {}
+  },
+  {
+    "arn": "arn:aws:iam::123456789012:role/CrossAccountAuditRole",
+    "id_value": "AROAEXAMPLEHHHHH",
+    "attached_policies": ["arn:aws:iam::aws:policy/SecurityAudit"],
+    "group_memberships": [],
+    "trust_policy": {
+      "Version": "2012-10-17",
+      "Statement": [{"Effect": "Allow", "Principal": {"AWS": "arn:aws:iam::999888777666:root"}, "Action": "sts:AssumeRole"}]
+    },
+    "is_admin": false,
+    "tags": {}
+  },
+  {
+    "arn": "arn:aws:iam::123456789012:role/CrossAccountAdminRole",
+    "id_value": "AROAEXAMPLEIIIII",
+    "attached_policies": ["arn:aws:iam::aws:policy/AdministratorAccess"],
+    "group_memberships": [],
+    "trust_policy": {
+      "Version": "2012-10-17",
+      "Statement": [{"Effect": "Allow", "Principal": {"AWS": "arn:aws:iam::555444333222:root"}, "Action": "sts:AssumeRole"}]
+    },
+    "is_admin": true,
+    "tags": {}
+  },
+  {
+    "arn": "arn:aws:iam::123456789012:role/VendorIntegrationRole",
+    "id_value": "AROAEXAMPLEJJJJJ",
+    "attached_policies": ["arn:aws:iam::123456789012:policy/VendorAccessPolicy"],
+    "group_memberships": [],
+    "trust_policy": {
+      "Version": "2012-10-17",
+      "Statement": [{"Effect": "Allow", "Principal": {"AWS": "*"}, "Action": "sts:AssumeRole", "Condition": {"StringEquals": {"sts:ExternalId": "vendor-12345"}}}]
+    },
+    "is_admin": false,
+    "tags": {"Vendor": "DataDog"}
+  },
+  {
+    "arn": "arn:aws:iam::123456789012:role/OrganizationAccountAccessRole",
+    "id_value": "AROAEXAMPLEKKKKK",
+    "attached_policies": ["arn:aws:iam::aws:policy/AdministratorAccess"],
+    "group_memberships": [],
+    "trust_policy": {
+      "Version": "2012-10-17",
+      "Statement": [{"Effect": "Allow", "Principal": {"AWS": "arn:aws:iam::111222333444:root"}, "Action": "sts:AssumeRole"}]
+    },
+    "is_admin": true,
+    "tags": {}
+  },
+  {
+    "arn": "arn:aws:iam::123456789012:role/AWSReservedSSO_AdministratorAccess_abc123",
+    "id_value": "AROAEXAMPLELLLLL",
+    "attached_policies": ["arn:aws:iam::aws:policy/AdministratorAccess"],
+    "group_memberships": [],
+    "trust_policy": {
+      "Version": "2012-10-17",
+      "Statement": [{"Effect": "Allow", "Principal": {"Federated": "arn:aws:iam::123456789012:saml-provider/AWSSSO"}, "Action": "sts:AssumeRoleWithSAML"}]
+    },
+    "is_admin": true,
+    "tags": {}
+  },
+  {
+    "arn": "arn:aws:iam::123456789012:role/StepFunctionsRole",
+    "id_value": "AROAEXAMPLEMMMMM",
+    "attached_policies": ["arn:aws:iam::123456789012:policy/StepFunctionsPolicy"],
+    "group_memberships": [],
+    "trust_policy": {
+      "Version": "2012-10-17",
+      "Statement": [{"Effect": "Allow", "Principal": {"Service": "states.amazonaws.com"}, "Action": "sts:AssumeRole"}]
+    },
+    "is_admin": false,
+    "tags": {}
+  },
+  {
+    "arn": "arn:aws:iam::123456789012:role/DataPipelineRole",
+    "id_value": "AROAEXAMPLENNNNN",
+    "attached_policies": ["arn:aws:iam::123456789012:policy/DataPipelinePolicy"],
+    "group_memberships": [],
+    "trust_policy": {
+      "Version": "2012-10-17",
+      "Statement": [{"Effect": "Allow", "Principal": {"Service": "datapipeline.amazonaws.com"}, "Action": "sts:AssumeRole"}]
+    },
+    "is_admin": false,
+    "tags": {}
+  },
+  {
+    "arn": "arn:aws:iam::123456789012:role/CloudFormationRole",
+    "id_value": "AROAEXAMPLEOOOOO",
+    "attached_policies": ["arn:aws:iam::aws:policy/AdministratorAccess"],
+    "group_memberships": [],
+    "trust_policy": {
+      "Version": "2012-10-17",
+      "Statement": [{"Effect": "Allow", "Principal": {"Service": "cloudformation.amazonaws.com"}, "Action": "sts:AssumeRole"}]
+    },
+    "is_admin": true,
+    "tags": {}
+  },
+  {
+    "arn": "arn:aws:iam::123456789012:role/AutoScalingRole",
+    "id_value": "AROAEXAMPLEPPPPP",
+    "attached_policies": ["arn:aws:iam::aws:policy/AdministratorAccess"],
+    "group_memberships": [],
+    "trust_policy": {
+      "Version": "2012-10-17",
+      "Statement": [{"Effect": "Allow", "Principal": {"Service": "autoscaling.amazonaws.com"}, "Action": "sts:AssumeRole"}]
+    },
+    "instance_profile": ["arn:aws:iam::123456789012:instance-profile/AutoScalingRole"],
+    "is_admin": true,
+    "tags": {"Purpose": "AutoScaling Admin"}
+  },
+  {
+    "arn": "arn:aws:iam::123456789012:user/sysops-user",
+    "id_value": "AIDAEXAMPLE77777",
+    "attached_policies": ["arn:aws:iam::123456789012:policy/SysOpsPolicy"],
+    "group_memberships": [],
+    "trust_policy": null,
+    "num_access_keys": 1,
+    "active_password": true,
+    "is_admin": false,
+    "has_mfa": true,
+    "tags": {"Team": "Operations"}
+  },
+  {
+    "arn": "arn:aws:iam::123456789012:role/SSMSessionRole",
+    "id_value": "AROAEXAMPLEQQQQQ",
+    "attached_policies": ["arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"],
+    "group_memberships": [],
+    "trust_policy": {
+      "Version": "2012-10-17",
+      "Statement": [{"Effect": "Allow", "Principal": {"Service": "ec2.amazonaws.com"}, "Action": "sts:AssumeRole"}]
+    },
+    "is_admin": false,
+    "tags": {}
+  },
+  {
+    "arn": "arn:aws:iam::123456789012:role/WildcardTrustRole",
+    "id_value": "AROAEXAMPLERRRRRR",
+    "attached_policies": ["arn:aws:iam::aws:policy/PowerUserAccess"],
+    "group_memberships": [],
+    "trust_policy": {
+      "Version": "2012-10-17",
+      "Statement": [{"Effect": "Allow", "Principal": {"AWS": "*"}, "Action": "sts:AssumeRole"}]
+    },
+    "is_admin": false,
+    "tags": {"DANGER": "Wildcard trust - anyone can assume"}
+  }
+]

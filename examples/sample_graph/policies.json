@@ -1,0 +1,242 @@
+[
+  {
+    "arn": "arn:aws:iam::123456789012:policy/DeveloperPolicy",
+    "name": "DeveloperPolicy",
+    "policy_doc": {
+      "Version": "2012-10-17",
+      "Statement": [
+        {"Sid": "CodeCommitAccess", "Effect": "Allow", "Action": ["codecommit:*"], "Resource": "*"},
+        {"Sid": "AssumeDevRoles", "Effect": "Allow", "Action": "sts:AssumeRole", "Resource": ["arn:aws:iam::123456789012:role/ShadowAdminRole", "arn:aws:iam::123456789012:role/CodeBuildServiceRole"]},
+        {"Sid": "PassRoleToServices", "Effect": "Allow", "Action": "iam:PassRole", "Resource": "*"},
+        {"Sid": "CodeBuildAccess", "Effect": "Allow", "Action": ["codebuild:CreateProject", "codebuild:StartBuild", "codebuild:BatchGetBuilds"], "Resource": "*"},
+        {"Sid": "IAMDangerous", "Effect": "Allow", "Action": ["iam:CreateAccessKey", "iam:ListUsers", "iam:GetUser"], "Resource": "*"}
+      ]
+    }
+  },
+  {
+    "arn": "arn:aws:iam::123456789012:policy/ShadowAdminPolicy",
+    "name": "ShadowAdminPolicy",
+    "policy_doc": {
+      "Version": "2012-10-17",
+      "Statement": [
+        {"Sid": "IAMFullAccess", "Effect": "Allow", "Action": ["iam:AttachRolePolicy", "iam:AttachUserPolicy", "iam:CreateLoginProfile", "iam:UpdateLoginProfile", "iam:PutRolePolicy", "iam:PutUserPolicy", "iam:CreatePolicyVersion", "iam:SetDefaultPolicyVersion", "iam:CreateAccessKey"], "Resource": "*"},
+        {"Sid": "STSAccess", "Effect": "Allow", "Action": "sts:AssumeRole", "Resource": "*"}
+      ]
+    }
+  },
+  {
+    "arn": "arn:aws:iam::123456789012:policy/JenkinsCIPolicy",
+    "name": "JenkinsCIPolicy",
+    "policy_doc": {
+      "Version": "2012-10-17",
+      "Statement": [
+        {"Sid": "EC2Deploy", "Effect": "Allow", "Action": ["ec2:RunInstances", "ec2:TerminateInstances", "ec2:DescribeInstances"], "Resource": "*"},
+        {"Sid": "LambdaDeploy", "Effect": "Allow", "Action": ["lambda:CreateFunction", "lambda:UpdateFunctionCode", "lambda:InvokeFunction"], "Resource": "*"},
+        {"Sid": "PassRole", "Effect": "Allow", "Action": "iam:PassRole", "Resource": "*"}
+      ]
+    }
+  },
+  {
+    "arn": "arn:aws:iam::123456789012:policy/TerraformDeployPolicy",
+    "name": "TerraformDeployPolicy",
+    "policy_doc": {
+      "Version": "2012-10-17",
+      "Statement": [
+        {"Sid": "TerraformEC2", "Effect": "Allow", "Action": ["ec2:*"], "Resource": "*"},
+        {"Sid": "TerraformCFN", "Effect": "Allow", "Action": ["cloudformation:CreateStack", "cloudformation:UpdateStack", "cloudformation:DeleteStack", "cloudformation:DescribeStacks"], "Resource": "*"},
+        {"Sid": "TerraformIAM", "Effect": "Allow", "Action": "iam:PassRole", "Resource": "*"}
+      ]
+    }
+  },
+  {
+    "arn": "arn:aws:iam::123456789012:policy/GitHubActionsPolicy",
+    "name": "GitHubActionsPolicy",
+    "policy_doc": {
+      "Version": "2012-10-17",
+      "Statement": [
+        {"Sid": "CodeBuildFull", "Effect": "Allow", "Action": ["codebuild:CreateProject", "codebuild:StartBuild", "codebuild:BatchGetBuilds", "codebuild:DeleteProject"], "Resource": "*"},
+        {"Sid": "PassRole", "Effect": "Allow", "Action": "iam:PassRole", "Resource": "*"},
+        {"Sid": "S3Artifacts", "Effect": "Allow", "Action": ["s3:GetObject", "s3:PutObject"], "Resource": "*"}
+      ]
+    }
+  },
+  {
+    "arn": "arn:aws:iam::123456789012:policy/DataSciencePolicy",
+    "name": "DataSciencePolicy",
+    "policy_doc": {
+      "Version": "2012-10-17",
+      "Statement": [
+        {"Sid": "S3Access", "Effect": "Allow", "Action": ["s3:GetObject", "s3:ListBucket", "s3:PutObject"], "Resource": "*"},
+        {"Sid": "GlueAccess", "Effect": "Allow", "Action": ["glue:CreateJob", "glue:StartJobRun", "glue:GetJob", "glue:UpdateJob"], "Resource": "*"},
+        {"Sid": "SageMakerAccess", "Effect": "Allow", "Action": ["sagemaker:CreateNotebookInstance", "sagemaker:DescribeNotebookInstance"], "Resource": "*"},
+        {"Sid": "DataPipeline", "Effect": "Allow", "Action": ["datapipeline:CreatePipeline", "datapipeline:ActivatePipeline"], "Resource": "*"},
+        {"Sid": "PassRole", "Effect": "Allow", "Action": "iam:PassRole", "Resource": "*"}
+      ]
+    }
+  },
+  {
+    "arn": "arn:aws:iam::123456789012:policy/DevOpsPolicy",
+    "name": "DevOpsPolicy",
+    "policy_doc": {
+      "Version": "2012-10-17",
+      "Statement": [
+        {"Sid": "EC2Full", "Effect": "Allow", "Action": ["ec2:RunInstances", "ec2:TerminateInstances", "ec2:DescribeInstances"], "Resource": "*"},
+        {"Sid": "ECSAccess", "Effect": "Allow", "Action": ["ecs:RunTask", "ecs:RegisterTaskDefinition", "ecs:DescribeTasks"], "Resource": "*"},
+        {"Sid": "StepFunctions", "Effect": "Allow", "Action": ["states:CreateStateMachine", "states:StartExecution"], "Resource": "*"},
+        {"Sid": "AssumeRoles", "Effect": "Allow", "Action": "sts:AssumeRole", "Resource": ["arn:aws:iam::123456789012:role/ShadowAdminRole"]},
+        {"Sid": "PassRole", "Effect": "Allow", "Action": "iam:PassRole", "Resource": "*"}
+      ]
+    }
+  },
+  {
+    "arn": "arn:aws:iam::123456789012:policy/ContractorLimitedAccess",
+    "name": "ContractorLimitedAccess",
+    "policy_doc": {
+      "Version": "2012-10-17",
+      "Statement": [
+        {"Sid": "S3ReadOnly", "Effect": "Allow", "Action": ["s3:GetObject", "s3:ListBucket"], "Resource": "arn:aws:s3:::project-bucket/*"},
+        {"Sid": "ECSTaskRun", "Effect": "Allow", "Action": ["ecs:RunTask", "ecs:DescribeTasks"], "Resource": "*"},
+        {"Sid": "PassRole", "Effect": "Allow", "Action": "iam:PassRole", "Resource": "arn:aws:iam::123456789012:role/ECSTaskRole"}
+      ]
+    }
+  },
+  {
+    "arn": "arn:aws:iam::123456789012:policy/SecurityTeamPolicy",
+    "name": "SecurityTeamPolicy",
+    "policy_doc": {
+      "Version": "2012-10-17",
+      "Statement": [
+        {"Sid": "IAMReadOnly", "Effect": "Allow", "Action": ["iam:Get*", "iam:List*"], "Resource": "*"},
+        {"Sid": "UpdateTrustPolicy", "Effect": "Allow", "Action": "iam:UpdateAssumeRolePolicy", "Resource": "*"},
+        {"Sid": "CloudTrailAccess", "Effect": "Allow", "Action": ["cloudtrail:LookupEvents", "cloudtrail:DescribeTrails"], "Resource": "*"}
+      ]
+    }
+  },
+  {
+    "arn": "arn:aws:iam::123456789012:policy/LambdaSecretsAccess",
+    "name": "LambdaSecretsAccess",
+    "policy_doc": {
+      "Version": "2012-10-17",
+      "Statement": [
+        {"Sid": "SecretsAccess", "Effect": "Allow", "Action": ["secretsmanager:GetSecretValue", "secretsmanager:ListSecrets"], "Resource": "*"},
+        {"Sid": "SSMAccess", "Effect": "Allow", "Action": ["ssm:GetParameter", "ssm:GetParameters", "ssm:GetParametersByPath"], "Resource": "*"}
+      ]
+    }
+  },
+  {
+    "arn": "arn:aws:iam::123456789012:policy/EC2InstancePolicy",
+    "name": "EC2InstancePolicy",
+    "policy_doc": {
+      "Version": "2012-10-17",
+      "Statement": [
+        {"Sid": "EC2Nested", "Effect": "Allow", "Action": ["ec2:RunInstances", "ec2:DescribeInstances"], "Resource": "*"},
+        {"Sid": "PassRole", "Effect": "Allow", "Action": "iam:PassRole", "Resource": "*"},
+        {"Sid": "SSMAgent", "Effect": "Allow", "Action": ["ssm:SendCommand", "ssm:GetCommandInvocation"], "Resource": "*"}
+      ]
+    }
+  },
+  {
+    "arn": "arn:aws:iam::123456789012:policy/CodeBuildPolicy",
+    "name": "CodeBuildPolicy",
+    "policy_doc": {
+      "Version": "2012-10-17",
+      "Statement": [
+        {"Sid": "CodeBuildExecution", "Effect": "Allow", "Action": ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"], "Resource": "*"},
+        {"Sid": "S3Artifacts", "Effect": "Allow", "Action": ["s3:GetObject", "s3:PutObject"], "Resource": "*"},
+        {"Sid": "AssumeRoles", "Effect": "Allow", "Action": "sts:AssumeRole", "Resource": "*"}
+      ]
+    }
+  },
+  {
+    "arn": "arn:aws:iam::123456789012:policy/CodePipelinePolicy",
+    "name": "CodePipelinePolicy",
+    "policy_doc": {
+      "Version": "2012-10-17",
+      "Statement": [
+        {"Sid": "CodePipelineAccess", "Effect": "Allow", "Action": ["codepipeline:*"], "Resource": "*"},
+        {"Sid": "CloudFormation", "Effect": "Allow", "Action": ["cloudformation:CreateStack", "cloudformation:UpdateStack", "cloudformation:DescribeStacks"], "Resource": "*"},
+        {"Sid": "PassRole", "Effect": "Allow", "Action": "iam:PassRole", "Resource": "*"}
+      ]
+    }
+  },
+  {
+    "arn": "arn:aws:iam::123456789012:policy/GlueS3Access",
+    "name": "GlueS3Access",
+    "policy_doc": {
+      "Version": "2012-10-17",
+      "Statement": [
+        {"Sid": "S3Access", "Effect": "Allow", "Action": ["s3:GetObject", "s3:ListBucket"], "Resource": "*"},
+        {"Sid": "LambdaInvoke", "Effect": "Allow", "Action": ["lambda:InvokeFunction"], "Resource": "*"}
+      ]
+    }
+  },
+  {
+    "arn": "arn:aws:iam::123456789012:policy/SageMakerS3Access",
+    "name": "SageMakerS3Access",
+    "policy_doc": {
+      "Version": "2012-10-17",
+      "Statement": [
+        {"Sid": "S3Full", "Effect": "Allow", "Action": ["s3:*"], "Resource": "*"},
+        {"Sid": "STSAssumeAdminForDebug", "Effect": "Allow", "Action": "sts:AssumeRole", "Resource": "arn:aws:iam::123456789012:role/AdminRole"}
+      ]
+    }
+  },
+  {
+    "arn": "arn:aws:iam::123456789012:policy/ECSTaskPolicy",
+    "name": "ECSTaskPolicy",
+    "policy_doc": {
+      "Version": "2012-10-17",
+      "Statement": [
+        {"Sid": "SSMAccess", "Effect": "Allow", "Action": ["ssm:GetParameter", "ssm:GetParameters"], "Resource": "*"},
+        {"Sid": "S3Access", "Effect": "Allow", "Action": ["s3:GetObject"], "Resource": "*"}
+      ]
+    }
+  },
+  {
+    "arn": "arn:aws:iam::123456789012:policy/VendorAccessPolicy",
+    "name": "VendorAccessPolicy",
+    "policy_doc": {
+      "Version": "2012-10-17",
+      "Statement": [
+        {"Sid": "LambdaModify", "Effect": "Allow", "Action": ["lambda:UpdateFunctionCode", "lambda:GetFunction"], "Resource": "*"},
+        {"Sid": "LogsRead", "Effect": "Allow", "Action": ["logs:GetLogEvents", "logs:FilterLogEvents"], "Resource": "*"}
+      ]
+    }
+  },
+  {
+    "arn": "arn:aws:iam::123456789012:policy/StepFunctionsPolicy",
+    "name": "StepFunctionsPolicy",
+    "policy_doc": {
+      "Version": "2012-10-17",
+      "Statement": [
+        {"Sid": "LambdaInvoke", "Effect": "Allow", "Action": ["lambda:InvokeFunction"], "Resource": "*"},
+        {"Sid": "SNSPublish", "Effect": "Allow", "Action": ["sns:Publish"], "Resource": "*"}
+      ]
+    }
+  },
+  {
+    "arn": "arn:aws:iam::123456789012:policy/DataPipelinePolicy",
+    "name": "DataPipelinePolicy",
+    "policy_doc": {
+      "Version": "2012-10-17",
+      "Statement": [
+        {"Sid": "EC2Full", "Effect": "Allow", "Action": ["ec2:RunInstances", "ec2:TerminateInstances"], "Resource": "*"},
+        {"Sid": "PassRole", "Effect": "Allow", "Action": "iam:PassRole", "Resource": "*"},
+        {"Sid": "S3Access", "Effect": "Allow", "Action": ["s3:*"], "Resource": "*"}
+      ]
+    }
+  },
+  {
+    "arn": "arn:aws:iam::123456789012:policy/SysOpsPolicy",
+    "name": "SysOpsPolicy",
+    "policy_doc": {
+      "Version": "2012-10-17",
+      "Statement": [
+        {"Sid": "AutoScalingManage", "Effect": "Allow", "Action": ["autoscaling:CreateAutoScalingGroup", "autoscaling:CreateLaunchConfiguration", "autoscaling:UpdateAutoScalingGroup", "autoscaling:DescribeAutoScalingGroups"], "Resource": "*"},
+        {"Sid": "SSMCommands", "Effect": "Allow", "Action": ["ssm:SendCommand", "ssm:StartSession", "ssm:GetCommandInvocation"], "Resource": "*"},
+        {"Sid": "EC2Manage", "Effect": "Allow", "Action": ["ec2:RunInstances", "ec2:DescribeInstances", "ec2:TerminateInstances"], "Resource": "*"},
+        {"Sid": "PassRole", "Effect": "Allow", "Action": "iam:PassRole", "Resource": "*"}
+      ]
+    }
+  }
+]

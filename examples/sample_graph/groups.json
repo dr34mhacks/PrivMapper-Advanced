@@ -1,0 +1,88 @@
+[
+  {
+    "arn": "arn:aws:iam::123456789012:group/Admins",
+    "attached_policies": [
+      "arn:aws:iam::aws:policy/AdministratorAccess"
+    ],
+    "members": [
+      "arn:aws:iam::123456789012:user/admin-user"
+    ]
+  },
+  {
+    "arn": "arn:aws:iam::123456789012:group/SecurityTeam",
+    "attached_policies": [
+      "arn:aws:iam::aws:policy/SecurityAudit",
+      "arn:aws:iam::123456789012:policy/SecurityTeamPolicy"
+    ],
+    "members": [
+      "arn:aws:iam::123456789012:user/security-admin"
+    ]
+  },
+  {
+    "arn": "arn:aws:iam::123456789012:group/Developers",
+    "attached_policies": [
+      "arn:aws:iam::123456789012:policy/DeveloperPolicy"
+    ],
+    "members": [
+      "arn:aws:iam::123456789012:user/alice-dev",
+      "arn:aws:iam::123456789012:user/bob-dev",
+      "arn:aws:iam::123456789012:user/charlie-devops"
+    ]
+  },
+  {
+    "arn": "arn:aws:iam::123456789012:group/DevOps",
+    "attached_policies": [
+      "arn:aws:iam::123456789012:policy/DevOpsPolicy"
+    ],
+    "members": [
+      "arn:aws:iam::123456789012:user/charlie-devops"
+    ]
+  },
+  {
+    "arn": "arn:aws:iam::123456789012:group/DataScience",
+    "attached_policies": [
+      "arn:aws:iam::123456789012:policy/DataSciencePolicy"
+    ],
+    "members": [
+      "arn:aws:iam::123456789012:user/eve-datascience"
+    ]
+  },
+  {
+    "arn": "arn:aws:iam::123456789012:group/Contractors",
+    "attached_policies": [
+      "arn:aws:iam::123456789012:policy/ContractorLimitedAccess"
+    ],
+    "members": [
+      "arn:aws:iam::123456789012:user/david-contractor"
+    ]
+  },
+  {
+    "arn": "arn:aws:iam::123456789012:group/CodeCommitUsers",
+    "attached_policies": [
+      "arn:aws:iam::aws:policy/AWSCodeCommitPowerUser"
+    ],
+    "members": [
+      "arn:aws:iam::123456789012:user/alice-dev",
+      "arn:aws:iam::123456789012:user/bob-dev"
+    ]
+  },
+  {
+    "arn": "arn:aws:iam::123456789012:group/S3ReadOnly",
+    "attached_policies": [
+      "arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess"
+    ],
+    "members": [
+      "arn:aws:iam::123456789012:user/eve-datascience",
+      "arn:aws:iam::123456789012:user/frank-support"
+    ]
+  },
+  {
+    "arn": "arn:aws:iam::123456789012:group/Support",
+    "attached_policies": [
+      "arn:aws:iam::aws:policy/ReadOnlyAccess"
+    ],
+    "members": [
+      "arn:aws:iam::123456789012:user/frank-support"
+    ]
+  }
+]
