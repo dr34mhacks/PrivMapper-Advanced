@@ -4,6 +4,7 @@ import argparse
 import os
 import re
 import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 from typing import List
@@ -11,9 +12,9 @@ from typing import List
 from .models import AccountAnalysis, Finding, RunMetadata
 from .knowledge import (AWS_MANAGED_PATTERNS, CHECK_LABEL, COMPUTE_CHECKS, CRED_CHECKS,
                         EXCLUDE_REGIONS, IAM_CHECKS, IAM_WILDCARD_THRESHOLD)
-from .utils import err, log, ok, warn
+from .utils import err, log, ok
 from .loader import GraphLoader, find_pmapper_graphs
-from .runner import PMapperRunner, get_enabled_regions
+from .runner import PMapperRunner
 from .analysis import AnalysisEngine
 from .queries import QueryEngine, QueryResultsAnalyzer
 from .crossaccount import CrossAccountAnalyzer
@@ -24,15 +25,18 @@ from .reporting.html_export import HTMLExporter
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Advanced AWS IAM Security Analysis Tool - Full PMapper Replacement",
+        description=("Evidence-backed AWS IAM graph analysis and reporting. "
+                     "Analyze existing PMapper data or collect multiple AWS profiles concurrently."),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
   # Run pmapper with auto-detected regions (recommended)
   %(prog)s --profile my-aws-profile --create-graph
   %(prog)s --profile profile1 --profile profile2 --create-graph
+  %(prog)s --profiles profile1 profile2 profile3 --workers 3
+  %(prog)s --profile-file ./aws-profiles.txt --create-graph
 
-  # Run pmapper with manual exclude-regions (old behavior)
+  # Run pmapper with explicitly excluded regions
   %(prog)s --profile my-aws-profile
 
   # Read existing pmapper graph data
@@ -44,6 +48,9 @@ Examples:
 
   # Auto-detect existing pmapper data
   %(prog)s --auto-detect
+
+  # No arguments: print this help menu and perform no scan
+  %(prog)s
 
   # PMapper-style queries (requires --input or --profile)
   %(prog)s -i ./graph --query "who can do iam:CreateUser"
@@ -64,7 +71,22 @@ Examples:
         action="append",
         dest="profiles",
         metavar="PROFILE",
-        help="AWS profile to analyze (runs pmapper). Can specify multiple.",
+        help="AWS profile to collect; repeat or use comma-separated names.",
+    )
+    parser.add_argument(
+        "--profiles",
+        action="append",
+        nargs="+",
+        dest="profile_groups",
+        metavar="PROFILE",
+        help="One or more AWS profiles to collect concurrently.",
+    )
+    parser.add_argument(
+        "--profile-file",
+        action="append",
+        dest="profile_files",
+        metavar="PATH",
+        help="Text file containing newline- or comma-separated AWS profile names; repeatable.",
     )
 
     parser.add_argument(
@@ -83,7 +105,7 @@ Examples:
     parser.add_argument(
         "--format", "-f",
         default="html",
-        help="Output formats: html,json,csv (comma-separated, default: html)",
+        help="Output formats: html,json,csv (comma-separated) or all (default: html)",
     )
     parser.add_argument(
         "--auto-detect", "-a",
@@ -99,6 +121,12 @@ Examples:
         "--create-graph",
         action="store_true",
         help="Auto-detect enabled regions and run pmapper graph create (recommended)",
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=4,
+        help="Maximum profiles to collect concurrently (default: 4)",
     )
 
     parser.add_argument(
@@ -123,7 +151,45 @@ Examples:
         help="Don't start HTTP server after generating report",
     )
 
+    if len(sys.argv) == 1:
+        parser.print_help()
+        return 0
+
     args = parser.parse_args()
+
+    profile_values = list(args.profiles or [])
+    for group in args.profile_groups or []:
+        profile_values.extend(group)
+    for profile_file in args.profile_files or []:
+        path = Path(profile_file).expanduser()
+        try:
+            content = path.read_text()
+        except OSError as ex:
+            parser.error(f"cannot read --profile-file {profile_file}: {ex}")
+        for line in content.splitlines():
+            line = line.split("#", 1)[0].strip()
+            if line:
+                profile_values.extend(line.split(","))
+    profiles = []
+    for value in profile_values:
+        profiles.extend(name.strip() for name in value.split(",") if name.strip())
+    args.profiles = list(dict.fromkeys(profiles)) or None
+
+    valid_formats = {"html", "json", "csv"}
+    if args.format.strip().lower() == "all":
+        args.format = "html,json,csv"
+    requested_formats = {f.strip().lower() for f in args.format.split(",") if f.strip()}
+    invalid_formats = requested_formats - valid_formats
+    if not requested_formats or invalid_formats:
+        parser.error("--format must be all or contain only: html,json,csv")
+    if args.workers < 1:
+        parser.error("--workers must be at least 1")
+    if not 1 <= args.port <= 65535:
+        parser.error("--port must be between 1 and 65535")
+    if (args.profile_groups or args.profile_files) and not args.profiles:
+        parser.error("profile list input did not contain any profile names")
+    if args.profiles and (args.inputs or args.auto_detect):
+        parser.error("profile inputs cannot be combined with --input or --auto-detect")
 
     output_dir = Path(args.output)
     analyses = []
@@ -140,27 +206,47 @@ Examples:
 
     if args.profiles:
         print(f"\n{'='*60}")
-        print(f"  PrivMapper Advanced - IAM Security Analysis")
-        print(f"  Mode: Run PMapper")
+        print("  PrivMapper Advanced - IAM Security Analysis")
+        print("  Mode: Run PMapper")
         print(f"  Profiles: {', '.join(args.profiles)}")
         if args.create_graph:
-            print(f"  Region Detection: Auto (enabled regions only)")
+            print("  Region Detection: Auto (enabled regions only)")
         print(f"{'='*60}\n")
 
         output_dir.mkdir(parents=True, exist_ok=True)
+
+        workers = max(1, min(args.workers, len(args.profiles)))
+        log(f"Collecting {len(args.profiles)} profile(s) with {workers} concurrent worker(s)")
+        profile_runs = {}
+        runners = {}
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="privmapper") as executor:
+            future_to_profile = {}
+            for profile in args.profiles:
+                runner = PMapperRunner(
+                    profile,
+                    output_dir,
+                    exclude_regions=args.exclude_regions,
+                    auto_detect_regions=args.create_graph,
+                )
+                runners[profile] = runner
+                future_to_profile[executor.submit(runner.run_full_analysis)] = profile
+
+            for future in as_completed(future_to_profile):
+                profile = future_to_profile[future]
+                try:
+                    profile_runs[profile] = future.result()
+                except Exception as ex:
+                    err(f"Profile {profile} failed: {ex}")
 
         for profile in args.profiles:
             log(f"{'═'*50}")
             log(f"Profile: {profile}")
             log(f"{'═'*50}")
 
-            runner = PMapperRunner(
-                profile,
-                output_dir,
-                exclude_regions=args.exclude_regions,
-                auto_detect_regions=args.create_graph
-            )
-            stats, results, svg_path = runner.run_full_analysis()
+            runner = runners[profile]
+            if profile not in profile_runs:
+                continue
+            stats, results, svg_path = profile_runs[profile]
 
             if runner.regions_used:
                 all_regions_used.extend(runner.regions_used)
@@ -170,6 +256,32 @@ Examples:
 
             if not stats:
                 err(f"Failed to analyze {profile}")
+                continue
+
+            # Prefer the generated JSON graph so live scans receive exactly the
+            # same boundary, trust, credential, evidence, and path analysis as
+            # --input mode. Text-query parsing remains a compatibility fallback.
+            graph_path = runner.find_graph_path(stats.get("account_id", ""))
+            if graph_path:
+                loader = GraphLoader(graph_path)
+                try:
+                    principals, edges, policies = loader.load()
+                except ValueError as ex:
+                    err(f"Profile {profile} produced an invalid graph: {ex}")
+                    continue
+                analysis = AnalysisEngine(
+                    principals, edges, policies, stats.get("account_id", "")
+                ).analyze()
+                analysis.account_alias = profile
+                analyses.append(analysis)
+                profile_results[profile] = {
+                    "stats": stats,
+                    "results": results,
+                    "svg_path": svg_path,
+                    "graph_path": graph_path,
+                }
+                ok(f"Profile {profile} complete - {len(analysis.findings)} findings, "
+                   f"{len(analysis.escalation_paths)} paths")
                 continue
 
             profile_results[profile] = {
@@ -330,8 +442,8 @@ Examples:
         input_paths = list(dict.fromkeys(input_paths))
 
         print(f"\n{'='*60}")
-        print(f"  PrivMapper Advanced - IAM Security Analysis")
-        print(f"  Mode: Read Existing Graph Data")
+        print("  PrivMapper Advanced - IAM Security Analysis")
+        print("  Mode: Read Existing Graph Data")
         print(f"  Analyzing {len(input_paths)} graph(s)")
         print(f"{'='*60}\n")
 
@@ -343,7 +455,11 @@ Examples:
                 print(f"[!] Invalid graph directory: {graph_path}")
                 continue
 
-            principals, edges, policies = loader.load()
+            try:
+                principals, edges, policies = loader.load()
+            except ValueError as ex:
+                print(f"[!] Could not load graph {graph_path}: {ex}")
+                continue
             print(f"    Loaded {len(principals)} principals, {len(edges)} edges, {len(policies)} policies")
 
             engine = AnalysisEngine(principals, edges, policies)
@@ -377,7 +493,7 @@ Examples:
 
     cross_findings = []
     if len(analyses) > 1:
-        print(f"\n[*] Running cross-account analysis...")
+        print("\n[*] Running cross-account analysis...")
         cross_analyzer = CrossAccountAnalyzer(analyses)
         cross_findings = cross_analyzer.analyze()
         print(f"    Found {len(cross_findings)} cross-account findings")
@@ -398,13 +514,13 @@ Examples:
         HTMLExporter.export(analyses, cross_findings, output_dir / "report.html", run_metadata)
 
     if "json" in formats:
-        JSONExporter.export(analyses, output_dir / "findings.json")
+        JSONExporter.export(analyses, output_dir / "findings.json", cross_findings)
 
     if "csv" in formats:
-        CSVExporter.export(analyses, output_dir / "findings.csv")
+        CSVExporter.export(analyses, output_dir / "findings.csv", cross_findings)
 
     print(f"\n{'='*60}")
-    print(f"  Analysis Complete")
+    print("  Analysis Complete")
     print(f"  Output: {output_dir}/")
     print(f"{'='*60}\n")
 
@@ -417,10 +533,9 @@ Examples:
         print(f"  [!] {total_paths} privilege escalation paths detected")
 
     if "html" in formats and not args.no_server:
-        report_path = output_dir / "report.html"
         print(f"\n  Starting local server on port {args.port}...")
         print(f"  Open in browser: http://localhost:{args.port}/report.html")
-        print(f"  Press Ctrl+C to stop the server\n")
+        print("  Press Ctrl+C to stop the server\n")
 
         import http.server
         import socketserver
@@ -442,5 +557,9 @@ Examples:
             else:
                 print(f"  [!] Could not start server: {e}")
             print(f"\n  Open report manually: open {output_dir}/report.html\n")
-    else:
+    elif "html" in formats:
         print(f"\n  Open report: open {output_dir}/report.html\n")
+    else:
+        generated = [str(output_dir / ("findings.json" if f == "json" else "findings.csv"))
+                     for f in formats if f in ("json", "csv")]
+        print(f"\n  Generated: {', '.join(generated)}\n")

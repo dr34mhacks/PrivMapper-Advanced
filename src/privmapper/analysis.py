@@ -4,6 +4,7 @@ import json
 import re
 from collections import defaultdict
 from dataclasses import asdict
+from fnmatch import fnmatchcase
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from .models import (AccountAnalysis, CrossAccountTrust, Edge, EscalationPath,
@@ -70,10 +71,10 @@ class AnalysisEngine:
         return analysis
 
     def _find_aws_managed_admins(self) -> List[Principal]:
-        """Find AWS-managed roles that are admins (expected but worth noting)."""
+        """Find service-linked roles that are admins (expected but worth noting)."""
         managed = []
         for arn, principal in self.principals.items():
-            if principal.is_admin and self._is_aws_managed(principal.name):
+            if principal.is_admin and self._is_aws_managed(principal):
                 managed.append(principal)
         return managed
 
@@ -124,14 +125,9 @@ class AnalysisEngine:
     @staticmethod
     def _expand_action(action: str) -> Set[str]:
         """Return the subset of DANGEROUS_ACTIONS an Action string grants."""
-        if action == "*":
-            return set(DANGEROUS_ACTIONS)
-        if action.endswith(":*"):
-            service = action.split(":")[0]
-            return {d for d in DANGEROUS_ACTIONS if d.startswith(service + ":")}
-        if action in DANGEROUS_ACTIONS:
-            return {action}
-        return set()
+        pattern = str(action).lower()
+        return {candidate for candidate in DANGEROUS_ACTIONS
+                if fnmatchcase(candidate.lower(), pattern)}
 
     def _dangerous_covered_by_statement(self, stmt: PolicyStatement) -> Set[str]:
         """Dangerous actions a statement's Action/NotAction clause matches."""
@@ -187,7 +183,7 @@ class AnalysisEngine:
         return out
 
     def _compute_all_capabilities(self):
-        """Compute effective dangerous actions per principal, AWS-faithfully.
+        """Compute a conservative inventory of potentially dangerous actions.
 
         Honors: Allow/Deny (broad unconditional Deny subtracts), NotAction, inline and
         group-inherited policies, the AdministratorAccess/managed-policy catalog, the
@@ -196,37 +192,43 @@ class AnalysisEngine:
         """
         for arn, principal in self.principals.items():
             allow = {}
+            allow_candidates = defaultdict(list)
             deny = set()
-            principal.boundary_capped = bool(principal.permissions_boundary)
+            principal.boundary_capped = False
 
             for pol, source in self._effective_policies(principal):
                 for stmt in pol.statements:
-                    if stmt.effect == "Allow":
+                    if stmt.effect.lower() == "allow":
                         if stmt.not_actions:
                             principal.has_notaction = True
                         covered = self._dangerous_covered_by_statement(stmt)
                         for a in covered:
-                            if a not in allow:
-                                allow[a] = {
-                                    "policy": pol.arn,
-                                    "policy_name": pol.name,
-                                    "source": source,
-                                    "sid": stmt.sid,
-                                    "resources": list(stmt.resources) or (["<NotResource>"] if stmt.not_resources else ["*"]),
-                                    "conditions": bool(stmt.conditions),
-                                }
-                    elif stmt.effect == "Deny":
-                        broad = ("*" in stmt.resources) or bool(stmt.not_resources) or (not stmt.resources)
+                            item = {
+                                "policy": pol.arn,
+                                "policy_name": pol.name,
+                                "source": source,
+                                "sid": stmt.sid,
+                                "resources": list(stmt.resources) or (["<NotResource>"] if stmt.not_resources else ["*"]),
+                                "conditions": stmt.conditions,
+                            }
+                            allow_candidates[a].append(item)
+                            allow.setdefault(a, item)
+                    elif stmt.effect.lower() == "deny":
+                        # Deny+NotResource still leaves the excluded resources usable, so it
+                        # cannot remove the action globally from this resource-agnostic set.
+                        broad = (("*" in stmt.resources) or (not stmt.resources)) and not stmt.not_resources
                         if broad and not stmt.conditions:
                             deny |= self._dangerous_covered_by_statement(stmt)
 
             if principal.is_admin:
                 for a in DANGEROUS_ACTIONS:
-                    allow.setdefault(a, {
+                    item = {
                         "policy": "arn:aws:iam::aws:policy/AdministratorAccess",
                         "policy_name": "AdministratorAccess",
-                        "source": "admin", "sid": "", "resources": ["*"], "conditions": False,
-                    })
+                        "source": "admin", "sid": "", "resources": ["*"], "conditions": {},
+                    }
+                    allow.setdefault(a, item)
+                    allow_candidates[a].append(item)
 
             dangerous = set(allow) - deny
 
@@ -234,14 +236,40 @@ class AnalysisEngine:
                 bpol = self.policies.get(principal.permissions_boundary)
                 bacts = None
                 if bpol:
-                    bacts = set()
+                    allow_statements = []
+                    bdeny = set()
                     for stmt in bpol.statements:
-                        if stmt.effect == "Allow":
-                            bacts |= self._dangerous_covered_by_statement(stmt)
+                        if stmt.effect.lower() == "allow":
+                            allow_statements.append(stmt)
+                        elif stmt.effect.lower() == "deny":
+                            broad = (("*" in stmt.resources) or (not stmt.resources)) and not stmt.not_resources
+                            if broad and not stmt.conditions:
+                                bdeny |= self._dangerous_covered_by_statement(stmt)
+                    bacts = set()
+                    for action in dangerous - bdeny:
+                        for evidence in allow_candidates.get(action, []):
+                            if any(
+                                action in self._dangerous_covered_by_statement(stmt)
+                                and self._resource_patterns_overlap(evidence.get("resources", ["*"]), stmt.resources)
+                                for stmt in allow_statements
+                            ):
+                                bacts.add(action)
+                                allow[action] = evidence
+                                break
                 else:
-                    bacts = resolve_managed_policy_actions(principal.permissions_boundary)
+                    resolved = resolve_managed_policy_actions(principal.permissions_boundary)
+                    if resolved is None:
+                        bacts = None
+                    else:
+                        bacts = set()
+                        for action_pattern in resolved:
+                            bacts |= self._expand_action(action_pattern)
                 if bacts is not None:
                     dangerous &= bacts
+                else:
+                    # The boundary exists but its body could not be resolved, so
+                    # remaining capability results are intentionally caveated.
+                    principal.boundary_capped = True
 
             principal.dangerous_actions = dangerous
             principal.action_evidence = {a: allow[a] for a in dangerous if a in allow}
@@ -255,6 +283,25 @@ class AnalysisEngine:
                 if action in CHECK_LABEL
             ]
 
+    @staticmethod
+    def _resource_patterns_overlap(identity_resources: List[str], boundary_resources: List[str]) -> bool:
+        """Return whether two positive Resource pattern sets can select a common ARN.
+
+        NotResource cannot be represented by the evidence summary, so it remains a
+        conservative possible match rather than being incorrectly eliminated.
+        """
+        left = identity_resources or ["*"]
+        right = boundary_resources or ["*"]
+        if "<NotResource>" in left:
+            return True
+        for identity_pattern in left:
+            for boundary_pattern in right:
+                if identity_pattern == "*" or boundary_pattern == "*":
+                    return True
+                if fnmatchcase(identity_pattern, boundary_pattern) or fnmatchcase(boundary_pattern, identity_pattern):
+                    return True
+        return False
+
     def _classify_capabilities(self, actions: Set[str]) -> List[Tuple[str, str, List[str]]]:
         """Classify actions into capability groups with severity."""
         groups = []
@@ -267,12 +314,15 @@ class AnalysisEngine:
 
         if iam_actions:
             if len(iam_actions) >= IAM_WILDCARD_THRESHOLD:
-                groups.append(("iam:*", "critical", sorted(iam_actions)))
+                # A collection of specific IAM actions is not proof of iam:*.
+                groups.append(("IAM (broad tracked set)", "high", sorted(iam_actions)))
             else:
                 groups.append(("IAM (specific)", "high", sorted(iam_actions)))
 
         if s3_actions:
-            label = "s3:*" if s3_actions >= S3_CHECKS else "S3 (partial)"
+            # The inventory only tracks selected high-impact S3 actions. Even all of
+            # them together is not proof that the policy grants s3:*.
+            label = "S3 (all tracked actions)" if s3_actions >= S3_CHECKS else "S3 (partial)"
             groups.append((label, "high", sorted(s3_actions)))
 
         if cred_actions:
@@ -286,116 +336,22 @@ class AnalysisEngine:
 
         return groups
 
-    def _has_wildcard_resource_for_action(self, principal: Principal, action: str) -> bool:
-        """Check if a principal has wildcard resource scope for a specific action.
-
-        This is important for distinguishing between:
-        - iam:CreateAccessKey on Resource: * (can create keys for any user - DANGEROUS)
-        - iam:CreateAccessKey on Resource: arn:aws:iam::*:user/${aws:username} (self only - not escalation)
-
-        Considers attached, inline, group-inherited, and resolved managed policies.
-        """
-        for policy, _source in self._effective_policies(principal):
-            for stmt in policy.statements:
-                if stmt.effect != "Allow":
-                    continue
-
-                action_matches = False
-                if stmt.not_actions:
-                    action_matches = action not in self._dangerous_covered_by_statement(
-                        PolicyStatement(effect="Allow", actions=list(stmt.not_actions), resources=[])
-                    ) and action not in stmt.not_actions
-                else:
-                    for stmt_action in stmt.actions:
-                        if stmt_action == "*" or stmt_action == action:
-                            action_matches = True
-                            break
-                        elif stmt_action.endswith(":*"):
-                            service = stmt_action.split(":")[0]
-                            if action.startswith(service + ":"):
-                                action_matches = True
-                                break
-
-                if not action_matches:
-                    continue
-
-                if stmt.not_resources and not stmt.resources:
-                    return True
-
-                for resource in stmt.resources:
-                    if resource == "*":
-                        return True
-                    if "${aws:username}" in resource or "${aws:userid}" in resource:
-                        continue
-                    if action.startswith("iam:"):
-                        if resource.endswith("/*") or resource.endswith(":*"):
-                            return True
-
-        return False
-
-    def _has_wildcard_passrole(self, principal: Principal) -> bool:
-        """Check if a principal can pass ANY role (Resource: *)."""
-        return self._has_wildcard_resource_for_action(principal, "iam:PassRole")
-
     def _find_shadow_admins(self) -> List[Principal]:
-        """Find principals with admin-equivalent permissions but no AdministratorAccess.
+        """Find non-admin principals with a PMapper-proven direct edge to admin.
 
-        A true shadow admin is one who has DIRECT escalation capabilities:
-        1. Can directly assume an admin role (1-hop sts:AssumeRole)
-        2. Has IAM-modifying permissions (iam:AttachRolePolicy, iam:CreateAccessKey, etc.)
-        3. Has iam:PassRole + compute permissions (can create Lambda/EC2/etc with admin role)
-
-        NOT someone who is just in a multi-hop escalation path.
+        Permission combinations alone are intentionally not promoted to shadow-admin:
+        exploitable IAM and PassRole techniques depend on the target, trust policy,
+        service conditions, and supporting permissions. PMapper's edge is the proof.
         """
         shadow = []
-
-        direct_escalation_actions = {
-            "iam:AttachUserPolicy", "iam:AttachRolePolicy", "iam:AttachGroupPolicy",
-            "iam:PutUserPolicy", "iam:PutRolePolicy", "iam:PutGroupPolicy",
-            "iam:CreatePolicyVersion", "iam:SetDefaultPolicyVersion",
-            "iam:UpdateAssumeRolePolicy", "iam:AddUserToGroup",
-        }
-
-        passrole_combo_actions = {
-            "lambda:CreateFunction", "lambda:UpdateFunctionCode",
-            "ec2:RunInstances", "cloudformation:CreateStack",
-            "codebuild:CreateProject", "glue:CreateJob",
-            "sagemaker:CreateNotebookInstance", "ecs:RunTask",
-        }
 
         for arn, principal in self.principals.items():
             if principal.is_admin:
                 continue
-            if self._is_aws_managed(principal.name):
+            if self._is_aws_managed(principal):
                 continue
 
-            can_assume_admin = False
-            for edge in self.edge_from.get(arn, []):
-                if edge.target in self.admins and "AssumeRole" in edge.short_reason:
-                    can_assume_admin = True
-                    break
-
-            if can_assume_admin:
-                shadow.append(principal)
-                continue
-
-            has_direct_iam = False
-            for iam_action in principal.dangerous_actions & direct_escalation_actions:
-                if self._has_wildcard_resource_for_action(principal, iam_action):
-                    has_direct_iam = True
-                    break
-
-            has_passrole = "iam:PassRole" in principal.dangerous_actions
-            has_wildcard_passrole = has_passrole and self._has_wildcard_passrole(principal)
-            has_compute = bool(principal.dangerous_actions & passrole_combo_actions)
-            has_passrole_combo = has_wildcard_passrole and has_compute
-
-            has_credential_theft = (
-                "iam:CreateAccessKey" in principal.dangerous_actions and
-                self._has_wildcard_resource_for_action(principal, "iam:CreateAccessKey")
-            )
-
-            if has_direct_iam or has_passrole_combo or has_credential_theft:
+            if any(edge.target in self.admins for edge in self.edge_from.get(arn, [])):
                 shadow.append(principal)
 
         return shadow
@@ -420,7 +376,7 @@ class AnalysisEngine:
     def _find_overly_permissive(self, exclude_arns: Optional[Set[str]] = None) -> List[Principal]:
         """Find principals with dangerous but non-admin permissions.
 
-        Excludes admins, AWS-managed roles, and (per the finding's own description)
+        Excludes admins, AWS service-linked roles, and (per the finding's own description)
         principals already reported as shadow admins, so the same principal is not
         double-counted across findings. Applies resource scope analysis to reduce FPs.
         """
@@ -432,7 +388,7 @@ class AnalysisEngine:
                 continue
             if arn in exclude_arns:
                 continue
-            if self._is_aws_managed(principal.name):
+            if self._is_aws_managed(principal):
                 continue
 
             risk_score = self._calculate_permission_risk(principal)
@@ -459,43 +415,18 @@ class AnalysisEngine:
             "iam:UpdateAssumeRolePolicy", "iam:AddUserToGroup", "iam:CreateAccessKey",
         }
 
-        for policy_arn in principal.policies:
-            policy = self.policies.get(policy_arn)
-            if not policy:
-                continue
-
-            for stmt in policy.statements:
-                if stmt.effect != "Allow":
-                    continue
-
-                is_wildcard_resource = any(r == "*" for r in stmt.resources)
-                has_conditions = bool(stmt.conditions)
-
-                for action in stmt.actions:
-                    base_score = 0
-
-                    if action == "*":
-                        base_score = 10
-                    elif action in escalation_actions:
-                        base_score = 4
-                    elif action in DANGEROUS_ACTIONS:
-                        base_score = 2
-                    elif action.endswith(":*"):
-                        service = action.split(":")[0]
-                        if service == "iam":
-                            base_score = 5
-                        elif service in ["sts", "secretsmanager", "ssm"]:
-                            base_score = 3
-                        elif service in ["s3", "ec2", "lambda"]:
-                            base_score = 2
-
-                    if not is_wildcard_resource and base_score > 0:
-                        base_score = max(1, base_score - 1)
-
-                    if has_conditions and base_score > 0:
-                        base_score = max(1, base_score - 1)
-
-                    score += base_score
+        # action_evidence is built from every effective source: direct, inline,
+        # group-inherited, and resolved AWS-managed policies. Using it here keeps
+        # finding classification aligned with the effective-permission result.
+        for action in principal.dangerous_actions:
+            evidence = principal.action_evidence.get(action, {})
+            base_score = 4 if action in escalation_actions else 2
+            resources = evidence.get("resources", ["*"])
+            if "*" not in resources:
+                base_score = max(1, base_score - 1)
+            if evidence.get("conditions"):
+                base_score = max(1, base_score - 1)
+            score += base_score
 
         return score
 
@@ -506,7 +437,7 @@ class AnalysisEngine:
         for arn, principal in self.principals.items():
             if principal.is_admin:
                 continue
-            if self._is_aws_managed(principal.name):
+            if self._is_aws_managed(principal):
                 continue
 
             admin_paths = self._find_paths_to_admin(arn)
@@ -531,11 +462,10 @@ class AnalysisEngine:
     def _find_paths_to_admin(self, start_arn: str) -> List[Tuple[str, List[Edge]]]:
         """BFS to find all paths from start to any admin."""
         results = []
-        queue = [(start_arn, [])]
-        visited = {start_arn}
+        queue = [(start_arn, [], {start_arn})]
 
         while queue:
-            current, path = queue.pop(0)
+            current, path, visited = queue.pop(0)
 
             for edge in self.edge_from.get(current, []):
                 if edge.target in visited:
@@ -546,8 +476,7 @@ class AnalysisEngine:
                 if edge.target in self.admins:
                     results.append((edge.target, new_path))
                 elif len(new_path) < 5:
-                    visited.add(edge.target)
-                    queue.append((edge.target, new_path))
+                    queue.append((edge.target, new_path, visited | {edge.target}))
 
         return results
 
@@ -556,7 +485,7 @@ class AnalysisEngine:
         if not hops:
             return "Unknown"
 
-        combined_reason = " ".join(h.reason for h in hops)
+        combined_reason = " ".join(f"{h.short_reason} {h.reason}" for h in hops)
 
         for technique, patterns in TECHNIQUE_PATTERNS.items():
             if any(re.search(p, combined_reason, re.I) for p in patterns):
@@ -606,6 +535,14 @@ class AnalysisEngine:
         path.mitre_techniques = get_mitre_for_technique(path.technique)
 
         path.attack_narrative = self._generate_attack_narrative(path)
+        path.hop_explanations = self._build_hop_explanations(path)
+        path.resulting_access = self._describe_resulting_access(path)
+        path.missing_prerequisites = self._find_missing_prerequisites(path)
+        path.evidence_status = (
+            "required-local-evidence-present"
+            if not path.missing_prerequisites else "incomplete-local-evidence"
+        )
+        path.validation_notes = self._build_path_validation_notes(path)
 
     def _generate_attack_narrative(self, path: EscalationPath) -> str:
         """Generate a human-readable attack narrative for the escalation path."""
@@ -614,13 +551,13 @@ class AnalysisEngine:
         target_name = path.target.name
 
         if source_type == "user":
-            narrative = f"An attacker who compromises the IAM user '{source_name}'"
+            narrative = f"The graph indicates that an attacker who compromises the IAM user '{source_name}'"
             if path.source.has_access_keys:
                 narrative += " (which has active access keys)"
         elif source_type == "role":
-            narrative = f"An attacker who can assume the role '{source_name}'"
+            narrative = f"The graph indicates that an attacker who can assume the role '{source_name}'"
         else:
-            narrative = f"An attacker with access to '{source_name}'"
+            narrative = f"The graph indicates that an attacker with access to '{source_name}'"
 
         if len(path.hops) == 1:
             hop = path.hops[0]
@@ -632,11 +569,203 @@ class AnalysisEngine:
                 narrative += f"  {i}. {hop.reason} -> {hop_target}\n"
 
         if path.target.is_admin:
-            narrative += "\nThis results in full administrative access to the AWS account, "
+            narrative += "\nIf the modeled steps remain valid in the live request context, this results in full administrative access to the AWS account, "
             narrative += "allowing the attacker to access all resources, exfiltrate data, "
             narrative += "create backdoors, and disable security controls."
 
         return narrative
+
+    @staticmethod
+    def _list_value(value: Any) -> List[Any]:
+        if value is None:
+            return []
+        return value if isinstance(value, list) else [value]
+
+    def _trust_evidence(self, target: Optional[Principal], mechanism: str,
+                        source_arn: str) -> List[Dict[str, Any]]:
+        """Return relevant role-trust statements without claiming live authorization."""
+        if not target or not isinstance(target.trust_policy, dict):
+            return []
+        statements = self._list_value(target.trust_policy.get("Statement", []))
+        evidence = []
+        for statement in statements:
+            if not isinstance(statement, dict) or statement.get("Effect", "").lower() != "allow":
+                continue
+            actions = [str(a) for a in self._list_value(statement.get("Action", []))]
+            if not any(fnmatchcase("sts:AssumeRole".lower(), a.lower()) for a in actions):
+                continue
+            principal = statement.get("Principal", {})
+            service_principal = {
+                "Lambda CreateFunction": "lambda.amazonaws.com",
+                "EC2 Instance Profile": "ec2.amazonaws.com",
+            }.get(mechanism)
+            if service_principal:
+                services = self._list_value(principal.get("Service", [])) if isinstance(principal, dict) else []
+                if service_principal not in services:
+                    continue
+            else:
+                aws_principals = self._list_value(principal.get("AWS", [])) if isinstance(principal, dict) else self._list_value(principal)
+                source_parts = source_arn.split(":")
+                source_account = source_parts[4] if len(source_parts) > 4 else ""
+                partition = source_parts[1] if len(source_parts) > 1 else "aws"
+                relevant = any(
+                    str(value) in {"*", source_arn, f"arn:{partition}:iam::{source_account}:root"}
+                    for value in aws_principals
+                )
+                if not relevant:
+                    continue
+            evidence.append({
+                "effect": "Allow",
+                "actions": actions,
+                "principal": principal,
+                "conditions": statement.get("Condition", {}),
+            })
+        return evidence
+
+    def _policy_evidence(self, principal: Optional[Principal], actions: List[str],
+                         target_arn: str) -> List[Dict[str, Any]]:
+        if not principal:
+            return []
+        evidence = []
+        for action in actions:
+            if action not in principal.dangerous_actions:
+                continue
+            target_scoped = action in {"sts:AssumeRole", "iam:PassRole"}
+            for policy, source in self._effective_policies(principal):
+                for statement in policy.statements:
+                    if statement.effect.lower() != "allow" or action not in self._dangerous_covered_by_statement(statement):
+                        continue
+                    if target_scoped:
+                        resources = statement.resources or ["*"]
+                        if not any(fnmatchcase(target_arn, resource) for resource in resources):
+                            continue
+                        if any(fnmatchcase(target_arn, excluded) for excluded in statement.not_resources):
+                            continue
+                    evidence.append({
+                        "action": action,
+                        "policy_name": policy.name,
+                        "policy_arn": policy.arn,
+                        "attachment_source": source,
+                        "sid": statement.sid,
+                        "resources": list(statement.resources) or (["<NotResource>"] if statement.not_resources else ["*"]),
+                        "not_resources": list(statement.not_resources),
+                        "conditions": statement.conditions,
+                    })
+        return evidence
+
+    def _build_hop_explanations(self, path: EscalationPath) -> List[Dict[str, Any]]:
+        explanations = []
+        for step, hop in enumerate(path.hops, 1):
+            source = self.principals.get(hop.source)
+            target = self.principals.get(hop.target)
+            mechanism = self._classify_technique([hop])
+            if mechanism == "Direct STS AssumeRole":
+                actions = ["sts:AssumeRole"]
+                access = (
+                    f"A successful AssumeRole call returns a role session with the permissions of "
+                    f"'{target.name if target else hop.target}', subject to all applicable limits."
+                )
+                why = (
+                    "PMapper generated an STS access edge. The call requires authorization to "
+                    "sts:AssumeRole and a compatible target role trust policy."
+                )
+            elif mechanism == "Lambda CreateFunction":
+                actions = ["iam:PassRole", "lambda:CreateFunction", "lambda:InvokeFunction"]
+                access = (
+                    f"Code that is successfully run by Lambda uses the execution-role credentials "
+                    f"and permissions of '{target.name if target else hop.target}'."
+                )
+                why = (
+                    "PMapper generated a Lambda edge. A usable path requires permission to pass this "
+                    "specific execution role, create/configure a function, cause it to run, and a target "
+                    "trust policy that permits lambda.amazonaws.com."
+                )
+            elif mechanism == "EC2 Instance Profile":
+                actions = ["iam:PassRole", "ec2:RunInstances"]
+                access = "Workloads launched with the instance profile can obtain the target role's credentials through IMDS."
+                why = "PMapper generated an EC2 edge based on PassRole and workload-launch capability."
+            else:
+                actions = []
+                access = f"The modeled edge reaches '{target.name if target else hop.target}'."
+                why = "PMapper generated this access edge from the exported IAM relationship."
+
+            policy_evidence = self._policy_evidence(source, actions, hop.target)
+            trust_evidence = self._trust_evidence(target, mechanism, hop.source)
+            if not policy_evidence:
+                why += " No matching retained identity-policy statement was found, so the graph edge is the only local proof and must be checked live."
+
+            explanations.append({
+                "step": step,
+                "source": hop.source,
+                "target": hop.target,
+                "mechanism": mechanism,
+                "why": why,
+                "graph_evidence": {"reason": hop.reason, "short_reason": hop.short_reason},
+                "identity_policy_evidence": policy_evidence,
+                "target_trust_evidence": trust_evidence,
+                "access_gained": access,
+            })
+        return explanations
+
+    @staticmethod
+    def _describe_resulting_access(path: EscalationPath) -> str:
+        context = "role session or service execution context"
+        if path.target.is_admin:
+            return (
+                f"If every hop succeeds, the source reaches the administrative {context} "
+                f"'{path.target.name}'. This is modeled account-administrator access, not proof that "
+                "a live request will succeed."
+            )
+        return f"If every hop succeeds, the source reaches {context} '{path.target.name}'."
+
+    @staticmethod
+    def _find_missing_prerequisites(path: EscalationPath) -> List[str]:
+        missing = []
+        for hop in path.hop_explanations:
+            actions = {item.get("action") for item in hop.get("identity_policy_evidence", [])}
+            mechanism = hop.get("mechanism")
+            if mechanism == "Direct STS AssumeRole":
+                if "sts:AssumeRole" not in actions:
+                    missing.append(f"Step {hop['step']}: no target-scoped sts:AssumeRole Allow was retained.")
+                if not hop.get("target_trust_evidence"):
+                    missing.append(f"Step {hop['step']}: no relevant target role trust statement was extracted.")
+            elif mechanism == "Lambda CreateFunction":
+                for action in ("iam:PassRole", "lambda:CreateFunction"):
+                    if action not in actions:
+                        missing.append(f"Step {hop['step']}: no applicable {action} Allow was retained.")
+                if "lambda:InvokeFunction" not in actions:
+                    missing.append(
+                        f"Step {hop['step']}: no InvokeFunction Allow was retained; prove another permitted trigger can run the function."
+                    )
+                if not hop.get("target_trust_evidence"):
+                    missing.append(f"Step {hop['step']}: no Lambda service trust statement was extracted from the target role.")
+            elif mechanism == "EC2 Instance Profile":
+                for action in ("iam:PassRole", "ec2:RunInstances"):
+                    if action not in actions:
+                        missing.append(f"Step {hop['step']}: no applicable {action} Allow was retained.")
+                if not hop.get("target_trust_evidence"):
+                    missing.append(f"Step {hop['step']}: no EC2 service trust statement was extracted from the target role.")
+            else:
+                missing.append(
+                    f"Step {hop['step']}: technique-specific prerequisites are not parsed; rely on the PMapper edge only after live validation."
+                )
+        return missing
+
+    @staticmethod
+    def _build_path_validation_notes(path: EscalationPath) -> List[str]:
+        notes = [
+            "Confirm the source credentials/session are usable and each referenced principal and resource still exists.",
+            "Evaluate SCPs, permissions boundaries, session policies, resource policies and all request-time conditions for every hop.",
+            "Treat the PMapper edge as static authorization evidence; validate with read-only simulation or an explicitly authorized test before reporting exploitability.",
+        ]
+        if any((e.get("conditions") or {}) for hop in path.hop_explanations
+               for e in hop.get("identity_policy_evidence", [])):
+            notes.append("At least one identity-policy Allow is conditional; the displayed condition must match the real request context.")
+        if any(hop.get("mechanism") == "Lambda CreateFunction" for hop in path.hop_explanations):
+            notes.append("For Lambda, confirm iam:PassedToService/resource scoping, execution-role trust, and a permitted trigger or InvokeFunction path.")
+        if len(path.hops) > 1:
+            notes.append("For this multi-hop route, repeat the authorization check from each newly obtained role session to the next target.")
+        return notes
 
     @staticmethod
     def _external_id_enforced(conditions: Dict) -> bool:
@@ -657,6 +786,27 @@ class AnalysisEngine:
                     if all(isinstance(x, str) and x and "*" not in x and "?" not in x for x in vals):
                         return True
         return False
+
+    @staticmethod
+    def _positive_condition_values(conditions: Dict, key_suffix: str, *, allow_like: bool = False) -> List[str]:
+        """Return values only from positive operators that can narrow a request."""
+        values = []
+        for operator, entries in (conditions or {}).items():
+            if not isinstance(entries, dict):
+                continue
+            op = operator.lower().split(":")[-1]
+            positive = op in {"stringequals", "arnequals", "bool"} or (allow_like and op in {"stringlike", "arnlike"})
+            if not positive:
+                continue
+            for key, value in entries.items():
+                if key.lower().endswith(key_suffix.lower()):
+                    values.extend(str(v) for v in (value if isinstance(value, list) else [value]))
+        return values
+
+    @classmethod
+    def _exact_condition_enforced(cls, conditions: Dict, key_suffix: str) -> bool:
+        values = cls._positive_condition_values(conditions, key_suffix)
+        return bool(values) and all(v and "*" not in v and "?" not in v for v in values)
 
     def _analyze_cross_account_trusts(self) -> List[CrossAccountTrust]:
         """Analyze role trust policies for external assumability.
@@ -680,7 +830,8 @@ class AnalysisEngine:
                 except Exception:
                     continue
 
-            target_is_admin = principal.is_admin or bool(principal.dangerous_actions)
+            target_is_admin = principal.is_admin
+            target_is_privileged = target_is_admin or bool(principal.dangerous_actions)
 
             statements = trust_doc.get("Statement", [])
             if isinstance(statements, dict):
@@ -699,11 +850,20 @@ class AnalysisEngine:
                 condition_str = json.dumps(conditions).lower()
                 has_external_id = "sts:externalid" in condition_str
                 external_id_enforced = self._external_id_enforced(conditions)
-                has_source = ("aws:sourcearn" in condition_str) or ("aws:sourceaccount" in condition_str)
-                has_org_id = "aws:principalorgid" in condition_str
-                has_principal_arn = "aws:principalarn" in condition_str
-                has_mfa = "aws:multifactorauthpresent" in condition_str
-                has_sub_aud = any(x in condition_str for x in (":sub", ":aud", "saml:aud", ":oaud"))
+                source_accounts = self._positive_condition_values(conditions, "aws:sourceaccount")
+                source_arns = self._positive_condition_values(conditions, "aws:sourcearn", allow_like=True)
+                has_source = (bool(source_accounts) and all(v.isdigit() and len(v) == 12 for v in source_accounts)) or \
+                    (bool(source_arns) and all(v.startswith("arn:") and not v.startswith("arn:*") for v in source_arns))
+                has_org_id = self._exact_condition_enforced(conditions, "aws:principalorgid")
+                has_principal_arn = self._exact_condition_enforced(conditions, "aws:principalarn")
+                mfa_values = self._positive_condition_values(conditions, "aws:multifactorauthpresent")
+                has_mfa = bool(mfa_values) and all(v.lower() == "true" for v in mfa_values)
+                sub_values = self._positive_condition_values(conditions, ":sub", allow_like=True)
+                aud_values = (self._positive_condition_values(conditions, ":aud") +
+                              self._positive_condition_values(conditions, ":oaud") +
+                              self._positive_condition_values(conditions, "saml:aud"))
+                has_sub = bool(sub_values)
+                has_aud = bool(aud_values)
 
                 aws_principals = principals_field.get("AWS", [])
                 if isinstance(aws_principals, str):
@@ -736,11 +896,12 @@ class AnalysisEngine:
                         elif has_external_id and not external_id_enforced:
                             risk, reason = "medium", "ExternalId present but NOT enforced (wildcard/Null/NotEquals) - confused-deputy risk"
                         else:
-                            risk, reason = "medium", "Specific external principal, no ExternalId - confused-deputy risk"
+                            risk, reason = "medium", "Specific external principal without an ExternalId (verify whether this is an owned or third-party account)"
 
-                    if target_is_admin and risk in ("medium", "high"):
-                        risk = "critical" if risk == "high" or is_wildcard else "high"
-                        reason += "; trusted-into role is ADMIN/privileged"
+                    if target_is_privileged and risk in ("medium", "high"):
+                        risk = "critical" if target_is_admin and (risk == "high" or is_wildcard) else "high"
+                        reason += ("; trusted-into role is ADMIN" if target_is_admin
+                                   else "; trusted-into role has dangerous permissions")
 
                     trusts.append(CrossAccountTrust(
                         role_arn=arn, role_name=principal.name,
@@ -749,7 +910,8 @@ class AnalysisEngine:
                         has_external_id=has_external_id, has_conditions=bool(conditions),
                         is_wildcard=is_wildcard, risk_level=risk,
                         principal_kind="AWS", external_id_enforced=external_id_enforced,
-                        target_is_admin=target_is_admin, reason=reason,
+                        target_is_admin=target_is_admin, target_is_privileged=target_is_privileged,
+                        reason=reason,
                         remediation_key="cross_account_wildcard" if is_wildcard else
                                         ("cross_account_no_external_id" if not external_id_enforced else ""),
                     ))
@@ -763,28 +925,30 @@ class AnalysisEngine:
                     is_github = "token.actions.githubusercontent.com" in fed_l
                     is_saml = ":saml-provider/" in fed_l
                     if is_github:
-                        if not has_sub_aud:
+                        github_aud = bool(aud_values) and all(v == "sts.amazonaws.com" for v in aud_values)
+                        if not has_sub and not github_aud:
                             risk = "critical"
                             reason = "GitHub Actions OIDC trust with NO sub/aud constraint - ANY GitHub repo can assume this role"
-                        elif ("*" in condition_str) or (":sub" not in condition_str):
+                        elif not has_sub or not github_aud or any(v in {"*", "repo:*"} or v.startswith("repo:*/") for v in sub_values):
                             risk = "high"
-                            reason = "GitHub Actions OIDC trust with a wildcard/under-constrained sub (branch/repo scoping too broad)"
+                            reason = "GitHub Actions OIDC trust with missing/under-constrained positive sub or aud restriction"
                         else:
                             risk = "low"
                             reason = "GitHub Actions OIDC trust scoped to a specific repo/branch via sub"
                     elif is_oidc:
-                        risk = "high" if not has_sub_aud else "low"
-                        reason = ("OIDC federated trust without sub/aud constraint" if not has_sub_aud
+                        risk = "high" if not (has_sub and has_aud) else "low"
+                        reason = ("OIDC federated trust without positive sub and aud constraints" if risk == "high"
                                   else "OIDC federated trust constrained by sub/aud")
                     elif is_saml:
-                        risk = "medium" if "saml:aud" not in condition_str else "low"
+                        risk = "medium" if not self._exact_condition_enforced(conditions, "saml:aud") else "low"
                         reason = ("SAML federated trust (verify IdP and saml:aud)" if risk != "low"
                                   else "SAML federated trust with audience restriction")
                     else:
                         risk, reason = "medium", "Federated trust to an external identity provider"
-                    if target_is_admin and risk in ("medium", "high"):
-                        risk = "critical" if risk == "high" else "high"
-                        reason += "; trusted-into role is ADMIN/privileged"
+                    if target_is_privileged and risk in ("medium", "high"):
+                        risk = "critical" if target_is_admin and risk == "high" else "high"
+                        reason += ("; trusted-into role is ADMIN" if target_is_admin
+                                   else "; trusted-into role has dangerous permissions")
                     trusts.append(CrossAccountTrust(
                         role_arn=arn, role_name=principal.name,
                         trusted_principal=str(fed),
@@ -792,7 +956,8 @@ class AnalysisEngine:
                         has_external_id=False, has_conditions=bool(conditions),
                         is_wildcard=False, risk_level=risk,
                         principal_kind="Federated", external_id_enforced=False,
-                        target_is_admin=target_is_admin, reason=reason,
+                        target_is_admin=target_is_admin, target_is_privileged=target_is_privileged,
+                        reason=reason,
                         remediation_key="federated_oidc",
                     ))
 
@@ -805,7 +970,7 @@ class AnalysisEngine:
                         continue
                     if has_source or has_org_id:
                         continue
-                    risk = "high" if target_is_admin else "medium"
+                    risk = "high" if target_is_privileged else "medium"
                     trusts.append(CrossAccountTrust(
                         role_arn=arn, role_name=principal.name,
                         trusted_principal=str(svc),
@@ -813,7 +978,7 @@ class AnalysisEngine:
                         has_external_id=False, has_conditions=bool(conditions),
                         is_wildcard=False, risk_level=risk,
                         principal_kind="Service", external_id_enforced=False,
-                        target_is_admin=target_is_admin,
+                        target_is_admin=target_is_admin, target_is_privileged=target_is_privileged,
                         reason=f"Service trust ({svc}) can act on behalf of other resources but is missing aws:SourceArn/aws:SourceAccount - cross-service confused-deputy risk",
                         remediation_key="service_confused_deputy",
                     ))
@@ -830,7 +995,54 @@ class AnalysisEngine:
         "secretsmanager:GetSecretValue", "ssm:GetParameter",
     ]
 
-    def _principal_evidence(self, p: Principal, limit: int = 6) -> List[Dict]:
+    @staticmethod
+    def _permission_explanation(action: str, resources: List[str], conditions: Any) -> str:
+        """Describe what the collected statement proves without inventing prerequisites."""
+        scope = "all resources supported by the action" if "*" in resources else \
+            f"the listed resource scope ({', '.join(resources[:2])}{' ...' if len(resources) > 2 else ''})"
+        caveat = " The statement is conditional; the shown condition must match at request time." if conditions else ""
+        if action == "iam:PassRole":
+            meaning = (f"Can pass {scope} to a compatible AWS service. This is not role assumption by itself; "
+                       "an allowed service API and a service trust relationship are also required.")
+        elif action.startswith("sts:AssumeRole"):
+            meaning = (f"The identity policy permits an STS role-assumption request against {scope}. "
+                       "The target role trust policy and any organization controls must also allow it.")
+        elif action.startswith("iam:Attach") or action.startswith("iam:Put"):
+            meaning = (f"Can modify permissions on {scope}. Escalation is possible only when that scope includes "
+                       "a usable identity and the requested policy operation is otherwise allowed.")
+        elif action in {"iam:CreatePolicyVersion", "iam:SetDefaultPolicyVersion"}:
+            meaning = (f"Can alter the effective version of {scope}. Impact depends on where that managed policy "
+                       "is attached and whether version limits and other controls permit the change.")
+        elif action in {"iam:CreateAccessKey", "iam:CreateLoginProfile", "iam:AddUserToGroup"}:
+            meaning = f"Can change credentials or membership for {scope}; this can provide access equal to the affected identity or group."
+        elif action in {"secretsmanager:GetSecretValue", "ssm:GetParameter", "ssm:GetParameters", "ssm:GetParametersByPath", "kms:Decrypt", "s3:GetObject"}:
+            meaning = f"Can read sensitive data from {scope}; resource policies, KMS authorization, and request context may further restrict access."
+        elif action.startswith(("lambda:", "ec2:", "codebuild:", "cloudformation:", "glue:", "ecs:", "sagemaker:")):
+            meaning = (f"Can invoke or modify compute/deployment functionality in {scope}. Privilege escalation additionally "
+                       "requires a usable execution role or an already privileged target and any supporting actions.")
+        else:
+            meaning = f"The collected identity-policy statement allows {action} against {scope}, subject to AWS's complete authorization evaluation."
+        return meaning + caveat
+
+    @staticmethod
+    def _validation_commands(p: Principal, evidence: List[Dict]) -> List[str]:
+        """Produce non-mutating, AWS CLI-valid commands tied to the actual evidence."""
+        commands = []
+        for item in evidence[:3]:
+            resources = item.get("resources") or ["*"]
+            resource = next((r for r in resources if r != "<NotResource>"), "*")
+            commands.append(
+                "aws iam simulate-principal-policy "
+                f"--policy-source-arn '{p.arn}' --action-names '{item['action']}' "
+                f"--resource-arns '{resource}'"
+            )
+        entity_flag = "--role-name" if p.principal_type == "role" else "--user-name"
+        commands.append(f"aws iam list-attached-{p.principal_type}-policies {entity_flag} '{p.name}'")
+        commands.append(f"aws iam list-{p.principal_type}-policies {entity_flag} '{p.name}'")
+        commands.append(f"aws iam generate-service-last-accessed-details --arn '{p.arn}'")
+        return commands
+
+    def _principal_evidence(self, p: Principal, limit: int = 10) -> List[Dict]:
         """Concrete per-principal evidence: which policy/statement grants each dangerous
         action. This is what a report needs ('what exactly is the issue')."""
         ev = getattr(p, "action_evidence", {}) or {}
@@ -839,14 +1051,18 @@ class AnalysisEngine:
         out = []
         for a in ordered[:limit]:
             e = ev[a]
+            resources = e.get("resources", ["*"])
+            conditions = e.get("conditions", {})
             out.append({
                 "action": a,
                 "policy": e.get("policy", ""),
                 "policy_name": e.get("policy_name", ""),
                 "source": e.get("source", "attached"),
                 "sid": e.get("sid", ""),
-                "resources": e.get("resources", ["*"]),
-                "conditional": e.get("conditions", False),
+                "resources": resources,
+                "conditions": conditions,
+                "conditional": bool(conditions),
+                "explanation": self._permission_explanation(a, resources, conditions),
             })
         return out
 
@@ -855,7 +1071,7 @@ class AnalysisEngine:
         findings = []
 
         explicit_admins = [p for arn, p in self.principals.items()
-                         if p.is_admin and not self._is_aws_managed(p.name)]
+                         if p.is_admin and not self._is_aws_managed(p)]
         total_admins = len(self.admins)
         managed_admin_count = total_admins - len(explicit_admins)
         if explicit_admins:
@@ -869,8 +1085,8 @@ class AnalysisEngine:
                             f"other {managed_admin_count} are AWS-managed/service roles reported separately below.)"),
                 principals=[p.arn for p in explicit_admins],
                 impact="Compromise of any of these credentials results in full account takeover.",
-                remediation="Review each admin principal. Replace AdministratorAccess with AWS managed job-function policies (PowerUserAccess, SystemAdministrator, etc.). "
-                           "Use IAM Access Analyzer to generate least-privilege policies based on actual access patterns. Enable MFA for all admin accounts. "
+                remediation="Review each admin principal and replace standing broad access with customer-managed least-privilege policies where practical. "
+                           "Use IAM Access Analyzer and CloudTrail activity to inform policy reduction. Require MFA for human administrative access. "
                            "Consider using AWS IAM Identity Center for centralized access management.",
                 details={
                     "principals_detail": [
@@ -914,6 +1130,7 @@ class AnalysisEngine:
                     "dangerous_actions": dangerous_actions,
                     "capabilities": p.capabilities[:10],
                     "evidence": self._principal_evidence(p),
+                    "permissions_boundary": p.permissions_boundary,
                     "boundary_capped": p.boundary_capped,
                     "has_notaction": p.has_notaction,
                     "unresolved_managed": p.unresolved_managed,
@@ -928,13 +1145,13 @@ class AnalysisEngine:
                 title="Shadow Administrators",
                 severity="critical",
                 category="iam",
-                description="These principals can escalate to admin privileges without having "
-                           "AdministratorAccess policy attached, making them invisible to standard IAM audits.",
+                description="The PMapper graph contains a direct access edge from each principal to an "
+                           "administrative principal even though AdministratorAccess is not attached directly. "
+                           "Validate runtime conditions and organization guardrails before reporting exploitation.",
                 principals=[p.arn for p in analysis.shadow_admins],
-                impact="Hidden administrative access that bypasses standard security reviews.",
-                remediation="Remove excessive permissions that enable privilege escalation. "
-                           "Implement IAM permissions boundaries to cap maximum permissions. "
-                           "Use AWS Organizations SCPs/RCPs for organization-wide guardrails. "
+                impact="If the modeled edge remains valid at runtime, compromise of the source principal can lead to administrative access.",
+                remediation="Remove or scope the policy/trust relationship that creates the proven edge. "
+                           "Use permissions boundaries and AWS Organizations SCPs/RCPs as additional guardrails, not as a substitute for removing unintended access. "
                            "Review with IAM Access Analyzer policy validation.",
                 details={"principals_detail": shadow_details},
             ))
@@ -947,6 +1164,7 @@ class AnalysisEngine:
                 sev = "critical" if has_critical else "high" if has_high else "medium"
 
                 dangerous_actions = sorted(p.dangerous_actions)[:20] if p.dangerous_actions else []
+                evidence = self._principal_evidence(p)
                 op_details.append({
                     "arn": p.arn,
                     "name": p.name,
@@ -956,7 +1174,11 @@ class AnalysisEngine:
                     "policies": p.policies[:10],
                     "dangerous_actions": dangerous_actions,
                     "capabilities": p.capabilities[:8],
-                    "evidence": self._principal_evidence(p),
+                    "evidence": evidence,
+                    "dangerous_action_count": len(p.dangerous_actions),
+                    "evidence_omitted_count": max(0, len(p.dangerous_actions) - len(evidence)),
+                    "validation_commands": self._validation_commands(p, evidence),
+                    "permissions_boundary": p.permissions_boundary,
                     "boundary_capped": p.boundary_capped,
                     "has_notaction": p.has_notaction,
                     "unresolved_managed": p.unresolved_managed,
@@ -968,11 +1190,12 @@ class AnalysisEngine:
 
             findings.append(Finding(
                 id=f"{self.account_id}_overly_permissive",
-                title="Overly Permissive IAM Principals",
+                title="Potentially Overly Permissive IAM Principals",
                 severity="high",
                 category="iam",
-                description="These principals have permissions significantly broader than required, "
-                           "excluding those already reported as administrators or shadow admins.",
+                description="Static policy evidence shows multiple high-impact permissions on these principals, "
+                           "excluding those already reported as administrators or shadow admins. Confirm job function, "
+                           "request context, and organization/resource guardrails before concluding the access is excessive.",
                 principals=[p.arn for p in analysis.overly_permissive[:20]],
                 impact="Increased blast radius in case of credential compromise. "
                       "Each principal has dangerous capabilities listed below.",
@@ -1002,8 +1225,8 @@ class AnalysisEngine:
                 principals=[t.role_arn for t in risky_trusts],
                 impact="External or under-constrained principals may assume these roles. Where the role is "
                       "itself admin/privileged, this is a direct external path to account compromise.",
-                remediation="AWS principals: replace Principal:'*' with specific ARNs and add an ENFORCED "
-                           "sts:ExternalId (StringEquals with a secret value) or aws:PrincipalOrgID. "
+                remediation="AWS principals: replace Principal:'*' with specific ARNs. For owned accounts, consider aws:PrincipalOrgID; "
+                           "for third-party delegation, use an enforced, provider-assigned sts:ExternalId. "
                            "Federated/OIDC: constrain the sub/aud (for GitHub Actions pin repo:ORG/REPO:ref:...). "
                            "Service trusts: add aws:SourceArn/aws:SourceAccount to prevent confused-deputy abuse.",
                 details={"trusts": [asdict(t) for t in risky_trusts]},
@@ -1017,15 +1240,15 @@ class AnalysisEngine:
                 title="IAM Credential Hygiene (MFA / Access Keys)",
                 severity=worst,
                 category="credential_hygiene",
-                description="IAM users with weak credential hygiene: console access without MFA and/or "
-                           "long-lived access keys. These are the most common root causes of real cloud "
-                           "account compromise and are core CIS AWS Foundations checks.",
+                description="IAM users requiring credential review: console access without MFA and/or "
+                           "active long-term access keys. An active key is inventory evidence, not proof "
+                           "that the key is old, unused, exposed, or improperly managed.",
                 principals=[c["arn"] for c in analysis.credential_hygiene],
                 impact="A phished password without MFA, or a leaked static access key, grants an attacker the "
                       "user's full permission set. Privileged users without MFA are the highest priority.",
-                remediation="Enforce MFA for all IAM users with console access (SCP/permission-boundary deny "
-                           "when aws:MultiFactorAuthPresent is false). Replace long-term access keys with "
-                           "short-lived credentials (IAM Identity Center / roles); rotate or delete unused keys.",
+                remediation="Enforce MFA for IAM users with console access. Prefer short-lived credentials "
+                           "through IAM Identity Center or roles; use a credential report and last-used data "
+                           "before deciding whether an active access key should be rotated or deleted.",
                 details={"issues": analysis.credential_hygiene},
             ))
 
@@ -1036,10 +1259,10 @@ class AnalysisEngine:
                 title="Critical Privilege Escalation Paths",
                 severity="critical",
                 category="privesc",
-                description=f"Found {len(critical_paths)} paths where non-admin principals can "
-                           "escalate to full administrative access.",
+                description=f"PMapper modeled {len(critical_paths)} critical paths from non-admin "
+                           "principals to full administrative access. Validate runtime conditions and external guardrails.",
                 principals=sorted(set(p.source.arn for p in critical_paths[:20])),
-                impact="Attackers with access to these principals can gain full account control.",
+                impact="If a modeled path is executable in the live request context, compromise of its source can lead to full account control.",
                 remediation="Remove or restrict permissions that enable escalation. Use permissions boundaries to limit maximum permissions. "
                            "Common fixes include: restricting iam:PassRole to specific roles, "
                            "adding resource conditions to sts:AssumeRole, limiting ec2:RunInstances.",
@@ -1051,6 +1274,10 @@ class AnalysisEngine:
 
         return findings
 
-    def _is_aws_managed(self, name: str) -> bool:
-        """Check if name matches AWS-managed resource patterns."""
-        return any(re.search(p, name) for p in AWS_MANAGED_PATTERNS)
+    def _is_aws_managed(self, principal: Principal) -> bool:
+        """Identify AWS service-linked roles from their reserved ARN path.
+
+        Role names such as CloudFormation*, AWSReservedSSO_* or StackSet-* are not
+        sufficient proof that a principal is AWS-owned and must not suppress findings.
+        """
+        return ":role/aws-service-role/" in principal.arn.lower()

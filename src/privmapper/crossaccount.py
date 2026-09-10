@@ -24,17 +24,19 @@ class CrossAccountAnalyzer:
         trust_chains = self._find_trust_chains()
         if trust_chains:
             findings.append(Finding(
-                id="cross_account_chain",
-                title="Cross-Account Trust Chains",
-                severity="high",
+                id="cross_account_trust_topology",
+                title="Cross-Account Trust Topology (Validation Required)",
+                severity="medium",
                 category="cross_account",
-                description=f"Found {len(trust_chains)} trust chains spanning multiple accounts.",
+                description=(f"Found {len(trust_chains)} multi-account trust sequences. Trust relationships "
+                             "alone do not prove that a principal can traverse the sequence; identity permissions, "
+                             "target trust conditions, SCPs/RCPs, boundaries, and session policies must also align."),
                 principals=[],
-                impact="Compromise of one account may lead to lateral movement across accounts.",
+                impact="A sequence may enable lateral movement only when the required AssumeRole authorization is confirmed at every hop.",
                 remediation="Review and minimize cross-account trust relationships. "
-                           "Implement strong external ID requirements. "
+                           "Use ExternalId for third-party confused-deputy scenarios and organization conditions for owned accounts where appropriate. "
                            "Consider using AWS Organizations SCPs to restrict cross-account access.",
-                details={"chains": trust_chains},
+                details={"chains": trust_chains, "proven_traversable": False},
             ))
 
         trust_counts = defaultdict(list)

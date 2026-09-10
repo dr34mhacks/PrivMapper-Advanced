@@ -4,12 +4,33 @@ import os
 import re
 import shutil
 import subprocess
+import sys
+import threading
 import time
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 from .knowledge import EXCLUDE_REGIONS, MANUAL_QUERIES, PRESET_QUERIES
 from .utils import err, log, ok, warn
+
+
+def _pmapper_storage_roots() -> List[Path]:
+    """Return PMapper's platform storage root plus its legacy location."""
+    configured = os.environ.get("PMAPPER_STORAGE")
+    if configured:
+        return [Path(configured).expanduser()]
+
+    if sys.platform in ("win32", "cygwin") and os.environ.get("APPDATA"):
+        platform_root = Path(os.environ["APPDATA"]) / "principalmapper"
+    elif sys.platform == "darwin":
+        platform_root = (Path.home() / "Library" / "Application Support" /
+                         "com.nccgroup.principalmapper")
+    else:
+        data_home = os.environ.get("XDG_DATA_HOME")
+        platform_root = ((Path(data_home).expanduser() if data_home else
+                          Path.home() / ".local" / "share") / "principalmapper")
+
+    return list(dict.fromkeys([platform_root, Path.home() / ".principalmapper"]))
 
 
 def get_enabled_regions(profile: str) -> List[str]:
@@ -53,6 +74,9 @@ def get_enabled_regions(profile: str) -> List[str]:
 class PMapperRunner:
     """Run pmapper commands and collect results."""
 
+    _account_locks: Dict[str, threading.Lock] = {}
+    _account_locks_guard = threading.Lock()
+
     def __init__(self, profile: str, output_dir: Path,
                  exclude_regions: str = EXCLUDE_REGIONS,
                  include_regions: Optional[List[str]] = None,
@@ -62,12 +86,16 @@ class PMapperRunner:
         self.exclude_regions = exclude_regions
         self.include_regions = include_regions
         self.auto_detect_regions = auto_detect_regions
-        self.profile_dir = output_dir / profile
+        # AWS profile names are user-controlled configuration values. Keep them
+        # from escaping the report directory or creating nested paths.
+        safe_profile = re.sub(r"[^A-Za-z0-9_.-]+", "_", profile).strip(".") or "profile"
+        self.profile_dir = output_dir / safe_profile
         self.preset_dir = self.profile_dir / "presets"
         self.query_dir = self.profile_dir / "queries"
         self.regions_used: List[str] = []
         self.regions_excluded: List[str] = []
         self.used_auto_detect: bool = False
+        self.account_id_hint: str = ""
 
         for d in (self.profile_dir, self.preset_dir, self.query_dir):
             d.mkdir(parents=True, exist_ok=True)
@@ -115,6 +143,24 @@ class PMapperRunner:
             if label:
                 warn(f"  {label} ({ex})")
             return False, ""
+
+    def get_account_id_hint(self) -> str:
+        """Resolve the profile's account before graph creation when AWS CLI is available."""
+        try:
+            result = subprocess.run(
+                ["aws", "sts", "get-caller-identity", "--query", "Account",
+                 "--output", "text", "--profile", self.profile],
+                capture_output=True, text=True, timeout=30,
+            )
+            account_id = result.stdout.strip()
+            return account_id if result.returncode == 0 and account_id.isdigit() else ""
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            return ""
+
+    @classmethod
+    def _lock_for_account(cls, key: str) -> threading.Lock:
+        with cls._account_locks_guard:
+            return cls._account_locks.setdefault(key, threading.Lock())
 
     def create_graph(self) -> bool:
         """Create the pmapper graph for this profile."""
@@ -214,11 +260,7 @@ class PMapperRunner:
 
         self.run_command(["visualize", "--filetype", "svg"], label="SVG generation")
 
-        search_dirs = [
-            Path.home() / ".local" / "share" / "principalmapper",
-            Path.home() / ".principalmapper",
-            Path("."),
-        ]
+        search_dirs = _pmapper_storage_roots() + [Path(".")]
 
         found_svg = None
         for sdir in search_dirs:
@@ -253,12 +295,37 @@ class PMapperRunner:
             findings.append(line)
         return findings
 
+    def find_graph_path(self, account_id: str) -> Optional[Path]:
+        """Locate the JSON graph written by PMapper for this account."""
+        if not account_id or account_id == "unknown":
+            return None
+        roots = _pmapper_storage_roots()
+        candidates = [root / account_id / "graph" for root in roots]
+        for candidate in candidates:
+            if (candidate / "nodes.json").is_file() and (candidate / "edges.json").is_file():
+                return candidate
+        return None
+
     def run_full_analysis(self) -> Tuple[Dict[str, str], Dict[str, List[str]], Optional[Path]]:
         """Run complete pmapper analysis. Returns (stats, all_results, svg_path)."""
+        self.account_id_hint = self.get_account_id_hint()
+        lock_key = self.account_id_hint or f"profile:{self.profile}"
+        with self._lock_for_account(lock_key):
+            return self._run_full_analysis()
+
+    def _run_full_analysis(self) -> Tuple[Dict[str, str], Dict[str, List[str]], Optional[Path]]:
         if not self.create_graph():
             return {}, {}, None
 
         stats = self.get_graph_stats()
+        if self.account_id_hint and "account_id" not in stats:
+            stats["account_id"] = self.account_id_hint
+
+        # The JSON graph is richer and is analyzed by PrivMapper itself. Avoid
+        # dozens of redundant sequential pmapper queries when it is available.
+        if self.find_graph_path(stats.get("account_id", "")):
+            ok(f"Profile {self.profile} graph collection complete")
+            return stats, {}, None
 
         preset_results = self.run_preset_queries()
         manual_results = self.run_manual_queries()

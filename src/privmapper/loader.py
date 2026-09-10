@@ -1,7 +1,9 @@
 """Load and parse PMapper graph JSON (nodes/edges/policies/groups) into the model."""
 
 import json
+import os
 import re
+import sys
 from pathlib import Path
 from typing import Dict, List, Tuple
 
@@ -34,6 +36,15 @@ class GraphLoader:
         policies = self._load_policies()
         members_by_group, policies_by_group = self._load_groups()
 
+        # PMapper's native schema stores group membership on each Node and the
+        # group's policies in groups.json; groups do not carry a member list.
+        for principal in principals.values():
+            for group_arn in principal.group_memberships:
+                for policy_arn in policies_by_group.get(group_arn, []):
+                    if policy_arn not in principal.group_policy_arns:
+                        principal.group_policy_arns.append(policy_arn)
+
+        # Also accept enriched graph exports that place members on groups.
         for group_arn, members in members_by_group.items():
             gpols = policies_by_group.get(group_arn, [])
             for member_arn in members:
@@ -92,7 +103,8 @@ class GraphLoader:
                                        node.get("TrustPolicy",
                                                node.get("AssumeRolePolicyDocument")))
 
-                num_keys = node.get("num_access_keys", node.get("NumAccessKeys"))
+                num_keys = node.get("num_access_keys",
+                                    node.get("access_keys", node.get("NumAccessKeys")))
                 has_keys = node.get("has_access_keys", node.get("AccessKeys", None))
                 if isinstance(has_keys, list):
                     num_keys = num_keys if num_keys is not None else len(has_keys)
@@ -116,6 +128,15 @@ class GraphLoader:
                                          node.get("PermissionsBoundary"))
                 if isinstance(perm_boundary, dict):
                     perm_boundary = perm_boundary.get("arn", perm_boundary.get("PermissionsBoundaryArn"))
+
+                raw_groups = node.get("group_memberships", node.get("GroupMemberships", []))
+                if not isinstance(raw_groups, list):
+                    raw_groups = []
+                group_memberships = [
+                    group.get("arn", group.get("Arn", "")) if isinstance(group, dict) else group
+                    for group in raw_groups
+                ]
+                group_memberships = [group for group in group_memberships if group]
 
                 inline_policies = []
                 raw_inline = node.get("inline_policies", node.get("InlinePolicies", []))
@@ -147,6 +168,7 @@ class GraphLoader:
                     has_access_keys=bool(has_keys),
                     num_access_keys=num_keys,
                     is_instance_profile=is_instance_profile,
+                    group_memberships=group_memberships,
                     has_mfa=has_mfa,
                     active_password=active_password,
                     id_value=id_value,
@@ -155,7 +177,7 @@ class GraphLoader:
                 )
 
         except Exception as e:
-            print(f"[!] Error loading nodes.json: {e}")
+            raise ValueError(f"Invalid nodes.json: {e}") from e
 
         return principals
 
@@ -184,7 +206,7 @@ class GraphLoader:
                     ))
 
         except Exception as e:
-            print(f"[!] Error loading edges.json: {e}")
+            raise ValueError(f"Invalid edges.json: {e}") from e
 
         return edges
 
@@ -272,7 +294,7 @@ class GraphLoader:
                 )
 
         except Exception as e:
-            print(f"[!] Error loading policies.json: {e}")
+            raise ValueError(f"Invalid policies.json: {e}") from e
 
         return policies
 
@@ -314,7 +336,7 @@ class GraphLoader:
                     ]
 
         except Exception as e:
-            print(f"[!] Error loading groups.json: {e}")
+            raise ValueError(f"Invalid groups.json: {e}") from e
 
         return members, group_policies
 
@@ -323,10 +345,20 @@ def find_pmapper_graphs() -> List[Path]:
     """Auto-detect pmapper graph directories."""
     graphs = []
 
-    search_paths = [
-        Path.home() / ".local" / "share" / "principalmapper",
-        Path.home() / ".principalmapper",
-    ]
+    configured_storage = os.environ.get("PMAPPER_STORAGE")
+    if configured_storage:
+        search_paths = [Path(configured_storage).expanduser()]
+    elif sys.platform in ("win32", "cygwin") and os.environ.get("APPDATA"):
+        search_paths = [Path(os.environ["APPDATA"]) / "principalmapper"]
+    elif sys.platform == "darwin":
+        search_paths = [Path.home() / "Library" / "Application Support" /
+                        "com.nccgroup.principalmapper"]
+    else:
+        data_home = os.environ.get("XDG_DATA_HOME")
+        search_paths = [((Path(data_home).expanduser() if data_home else
+                         Path.home() / ".local" / "share") / "principalmapper")]
+    search_paths.append(Path.home() / ".principalmapper")
+    search_paths = list(dict.fromkeys(search_paths))
 
     for base in search_paths:
         if not base.exists():

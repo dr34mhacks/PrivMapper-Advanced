@@ -1,18 +1,17 @@
 """Interactive HTML report generation."""
 
 import json
+import base64
+import hashlib
 import re
 from collections import defaultdict
-from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional
 
 from ..models import (AccountAnalysis, CrossAccountTrust, EscalationPath, Finding,
                       RunMetadata)
-from ..knowledge import (AWS_MANAGED_PATTERNS, CVSS_VECTORS, DANGEROUS_ACTIONS,
-                         get_exploitation_guidance)
-from ..remediation import RemediationEngine
+from ..knowledge import DANGEROUS_ACTIONS, get_exploitation_guidance
 from ..queries import QueryEngine
 from .assets import CSS as _CSS, GRAPH_JS as _GRAPH_JS, APP_JS as _APP_JS
 
@@ -25,6 +24,54 @@ class HTMLExporter:
     GRAPH_JS = _GRAPH_JS
 
     JS = _APP_JS
+
+    CYTOSCAPE_SHA256 = "92d752b48ea949720675865197fd2a0001c95bc5888545e990af60321712d4c6"
+    FONT_MANIFEST = (
+        ("inter-400.ttf", "Inter", 400, "1b08e7fc267a5c7e1d614100f604b83e7e8a0be241f0f288faa2b3ac93a683ba"),
+        ("inter-500.ttf", "Inter", 500, "8c883f63b2c4157d997319f2c8bc6995ed4357ef371940d31ca159004a4aae63"),
+        ("inter-600.ttf", "Inter", 600, "e7a1aaf7eda9f2fad4131725fa556265ec75ca7b2d756260173a040363e8d4f7"),
+        ("inter-700.ttf", "Inter", 700, "b37284b5701b6b168dfc770aa1a4ac492106422fd3ba76bc7641e37434e8019c"),
+        ("inter-800.ttf", "Inter", 800, "eec66af7f2337bd34fe6e801cf92ededcb57a20c0d7bc40a61d4eefcbe3dd40c"),
+        ("jetbrains-mono-400.ttf", "JetBrains Mono", 400, "44ce4a84f20d60f24539bd0cef11f79c29e38609e0f8adf18551c9794a5d9dc3"),
+        ("jetbrains-mono-500.ttf", "JetBrains Mono", 500, "3386a05f6ece969e4537de6be894170d20558e82f7d56c8c5d332972ef172160"),
+        ("jetbrains-mono-600.ttf", "JetBrains Mono", 600, "df54dbfafba61d4911eb3dab9bba2d20531fb009f01d64dd42fa96ab862584d8"),
+    )
+
+    @classmethod
+    def _cytoscape_js(cls) -> str:
+        """Load the pinned vendored graph library and reject unexpected changes."""
+        asset = Path(__file__).with_name("vendor") / "cytoscape-3.28.1.min.js"
+        payload = asset.read_bytes()
+        digest = hashlib.sha256(payload).hexdigest()
+        if digest != cls.CYTOSCAPE_SHA256:
+            raise RuntimeError(f"vendored Cytoscape integrity check failed: {digest}")
+        return payload.decode("utf-8")
+
+    @classmethod
+    def _font_css(cls) -> str:
+        """Embed the original Google Fonts weights as data URLs for offline reports."""
+        font_dir = Path(__file__).with_name("vendor") / "fonts"
+        rules = []
+        for filename, family, weight, expected in cls.FONT_MANIFEST:
+            payload = (font_dir / filename).read_bytes()
+            if hashlib.sha256(payload).hexdigest() != expected:
+                raise RuntimeError(f"vendored font integrity check failed: {filename}")
+            encoded = base64.b64encode(payload).decode("ascii")
+            rules.append(
+                f"@font-face{{font-family:'{family}';font-style:normal;font-weight:{weight};font-display:swap;"
+                f"src:url(data:font/ttf;base64,{encoded}) format('truetype');}}"
+            )
+        return "".join(rules)
+
+    @staticmethod
+    def _json_for_script(value) -> str:
+        """Serialize data without allowing it to terminate an HTML script block."""
+        return (json.dumps(value)
+                .replace("&", "\\u0026")
+                .replace("<", "\\u003c")
+                .replace(">", "\\u003e")
+                .replace("\u2028", "\\u2028")
+                .replace("\u2029", "\\u2029"))
 
     @classmethod
     def export(cls, analyses: List[AccountAnalysis], cross_account_findings: List[Finding],
@@ -43,18 +90,22 @@ class HTMLExporter:
         ) + sum(1 for f in cross_account_findings if f.severity == "critical")
 
         graph_data = cls._build_graph_data(analyses)
-        graph_json = json.dumps(graph_data)
+        graph_json = cls._json_for_script(graph_data)
 
         policy_scripts = cls._generate_policy_scripts(analyses)
+        cytoscape_js = cls._cytoscape_js()
+        font_css = cls._font_css()
 
         html = f"""<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="referrer" content="no-referrer">
+    <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data: blob:; font-src data:; connect-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'">
     <title>IAM Security Report - {run_date}</title>
-    <style>{cls.CSS}</style>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/cytoscape/3.28.1/cytoscape.min.js"></script>
+    <style>{font_css}{cls.CSS}</style>
+    <script>{cytoscape_js}</script>
 </head>
 <body>
     <!-- Sidebar Navigation -->
@@ -64,7 +115,7 @@ class HTMLExporter:
                 <div class="sidebar-logo-icon">&#9733;</div>
                 PrivMapper
             </div>
-            <div class="sidebar-version">Advanced v1.0</div>
+            <div class="sidebar-version">Advanced v2.0</div>
         </div>
         <nav class="sidebar-nav">
             <div class="sidebar-section">Overview</div>
@@ -179,7 +230,7 @@ class HTMLExporter:
                     <div style="padding:40px;text-align:center;color:var(--tx2);background:var(--bg2);border-radius:var(--radius-lg);border:1px dashed var(--bd)">
                         <div style="font-size:32px;margin-bottom:12px">&#10004;</div>
                         <div style="font-size:14px;font-weight:600;color:var(--ok)">No Critical Findings</div>
-                        <div style="font-size:12px;margin-top:8px">Great job! No critical security issues detected.</div>
+                        <div style="font-size:12px;margin-top:8px">No critical issue was detected in the supplied graph. Review the methodology limits before treating this as assurance.</div>
                     </div>"""
 
         html += """
@@ -315,7 +366,6 @@ class HTMLExporter:
                     <tbody>
 """
             shadow_arns = {p.arn for p in analysis.shadow_admins}
-            overperm_arns = {p.arn for p in analysis.overly_permissive}
             for arn, principal in sorted(analysis.principals.items(), key=lambda x: (not x[1].is_admin, x[1].name)):
                 is_shadow = arn in shadow_arns
                 cap_count = len(principal.dangerous_actions) if principal.dangerous_actions else 0
@@ -363,8 +413,18 @@ class HTMLExporter:
 """
 
         html += f"""
-            <div style="height:60px"></div><!-- Spacer for fixed footer -->
         </div><!-- End main -->
+        <footer class="site-footer">
+            <div>
+                Made with <span style="color:#e94560">&hearts;</span> by
+                <a href="https://github.com/dr34mhacks" target="_blank" rel="noopener noreferrer">Sid</a>
+            </div>
+            <div>
+                Built on the shoulders of
+                <a href="https://github.com/nccgroup/PMapper" target="_blank" rel="noopener noreferrer">PMapper</a>
+                by NCC Group
+            </div>
+        </footer>
     </div><!-- End main-wrapper -->
 
     <script>{cls.JS}</script>
@@ -419,18 +479,6 @@ class HTMLExporter:
         </div>
     </div>
 
-    <!-- Footer -->
-    <footer class="site-footer">
-        <div>
-            Made with <span style="color:#e94560">&hearts;</span> by
-            <a href="https://github.com/dr34mhacks" target="_blank">Sid</a>
-        </div>
-        <div>
-            Built on the shoulders of
-            <a href="https://github.com/nccgroup/PMapper" target="_blank">PMapper</a>
-            by NCC Group
-        </div>
-    </footer>
 </body>
 </html>"""
 
@@ -597,13 +645,13 @@ class HTMLExporter:
         if refs:
             refs_html = '<div style="margin-top:12px;font-size:11px;color:var(--tx2)"><strong>References:</strong><br>'
             for ref in refs:
-                refs_html += f'<a href="{cls._escape(ref)}" target="_blank" style="color:var(--primary);text-decoration:none">{cls._escape(ref)}</a><br>'
+                refs_html += f'<a href="{cls._escape(ref)}" target="_blank" rel="noopener noreferrer" style="color:var(--primary);text-decoration:none">{cls._escape(ref)}</a><br>'
             refs_html += '</div>'
 
         cvss = guidance.get("cvss_estimate", "")
         cvss_vector = guidance.get("cvss_vector", "")
         cvss_html = f'<span style="font-family:var(--mono);font-size:10px;color:var(--cr);margin-left:8px">{cls._escape(cvss)}</span>' if cvss else ""
-        cvss_vector_html = (f'<p style="font-size:11px;margin-top:6px"><strong>CVSS v3.1:</strong> '
+        cvss_vector_html = (f'<p style="font-size:11px;margin-top:6px"><strong>Suggested contextual CVSS v3.1 (validate scope):</strong> '
                             f'<code style="font-size:10px">{cls._escape(cvss_vector)}</code></p>') if cvss_vector else ""
 
         how_to_report = cls._render_how_to_report(finding, guidance, cvss, cvss_vector)
@@ -637,13 +685,13 @@ class HTMLExporter:
                             {principals_html}
                         </div>
                         <div class="finding-section">
-                            <h4>Exploitation Steps</h4>
+                            <h4>Potential Abuse Scenario (validate prerequisites)</h4>
                             {exploit_html if exploit_html else f'<p style="font-size:12px;color:var(--tx2)">See AWS CLI commands below</p>'}
                         </div>
                     </div>
                     <div class="finding-section" style="margin-top:16px">
-                        <h4>AWS CLI Commands (Proof of Concept)</h4>
-                        <p style="font-size:11px;color:var(--tx2);margin-bottom:8px">Commands for validating or exploiting this finding:</p>
+                        <h4>AWS CLI Validation / Controlled Proof of Concept</h4>
+                        <p style="font-size:11px;color:var(--tx2);margin-bottom:8px">These commands are non-mutating validation aids. Supply the exact resource and required context values; simulator output can differ from live authorization.</p>
                         {cli_html if cli_html else '<p style="font-size:12px;color:var(--tx2);font-style:italic">No specific commands available</p>'}
                     </div>
                     <div class="finding-grid" style="margin-top:16px">
@@ -669,18 +717,31 @@ class HTMLExporter:
     def _render_how_to_report(cls, finding, guidance, cvss, cvss_vector) -> str:
         """A copy-paste report skeleton so the security team can lift a finding straight
         into an assessment deliverable."""
-        title = cls._escape(finding.title)
         sev = finding.severity.upper()
         n = len(finding.principals)
         affected = chr(10).join(finding.principals[:25])
         if len(finding.principals) > 25:
             affected += f"\n... (+{len(finding.principals) - 25} more)"
         evidence = guidance.get("evidence", "See affected principals and their attached policies.")
+        principal_evidence = []
+        for pd in finding.details.get("principals_detail", [])[:5]:
+            rows = []
+            for ev in pd.get("evidence", [])[:4]:
+                resource = ", ".join(ev.get("resources") or ["*"])
+                condition = json.dumps(ev.get("conditions") or {}, sort_keys=True)
+                rows.append(
+                    f"  - {ev.get('action', '')} via {ev.get('policy_name', '')}; "
+                    f"Resource={resource}; Condition={condition or '{}'}"
+                )
+            if rows:
+                principal_evidence.append(f"{pd.get('arn', pd.get('name', ''))}:\n" + "\n".join(rows))
+        if principal_evidence:
+            evidence += "\n\nCollected policy evidence (top 5 principals / 4 actions each):\n" + "\n".join(principal_evidence)
         remediation = finding.remediation
         report_text = (
             f"Title: {finding.title}\n"
             f"Severity: {sev}" + (f"  |  {cvss}" if cvss else "") + "\n"
-            + (f"CVSS: {cvss_vector}\n" if cvss_vector else "")
+            + (f"Suggested contextual CVSS (validate scope): {cvss_vector}\n" if cvss_vector else "")
             + f"\nDescription:\n{guidance.get('description', finding.description)}\n"
             f"\nAffected principals ({n}):\n{affected}\n"
             f"\nEvidence / how to confirm:\n{evidence}\n"
@@ -710,8 +771,9 @@ class HTMLExporter:
         html += '<th>User</th><th>Privileged</th><th>Console PW</th><th>MFA</th><th>Access keys</th><th>Severity</th><th>Issue</th>'
         html += '</tr></thead><tbody>'
         for c in issues:
-            mfa = 'Yes' if c.get('has_mfa') else "<span style='color:var(--cr)'>No</span>"
             pw = 'Yes' if c.get('active_password') else 'No'
+            mfa = ('Yes' if c.get('has_mfa') else "<span style='color:var(--cr)'>No</span>") \
+                if c.get('active_password') else 'N/A'
             priv = '<span class="badge high" style="font-size:8px">Yes</span>' if c.get('privileged') else 'No'
             keys = c.get('num_access_keys', 0)
             keys_html = f"<span style='color:var(--cr)'>{keys}</span>" if keys else "0"
@@ -728,14 +790,16 @@ class HTMLExporter:
         html = '<div class="affected-principals"><div class="affected-principals-header">'
         html += f'<span style="font-size:10px;color:var(--tx2)">{len(trusts)} trust(s)</span></div>'
         html += '<div class="table-wrapper"><table class="trust-table"><thead><tr>'
-        html += '<th>Role</th><th>Kind</th><th>Trusted principal</th><th>Target admin</th><th>Risk</th><th>Why</th>'
+        html += '<th>Role</th><th>Kind</th><th>Trusted principal</th><th>Admin</th><th>Privileged</th><th>Risk</th><th>Why</th>'
         html += '</tr></thead><tbody>'
         for t in trusts:
             tgt = '<span class="badge critical" style="font-size:8px">Yes</span>' if t.get('target_is_admin') else 'No'
+            privileged = '<span class="badge high" style="font-size:8px">Yes</span>' if t.get('target_is_privileged') else 'No'
             html += (f"<tr><td><code>{cls._escape(t.get('role_name',''))}</code></td>"
                      f"<td>{cls._escape(t.get('principal_kind','AWS'))}</td>"
                      f"<td><code style='font-size:10px'>{cls._escape(str(t.get('trusted_principal',''))[:60])}</code></td>"
                      f"<td>{tgt}</td>"
+                     f"<td>{privileged}</td>"
                      f"<td><span class='badge {t.get('risk_level','medium')}'>{t.get('risk_level','')}</span></td>"
                      f"<td style='font-size:11px'>{cls._escape(t.get('reason',''))}</td></tr>")
         html += '</tbody></table></div></div>'
@@ -763,28 +827,70 @@ class HTMLExporter:
         html += '</div></div>'
 
         if is_overperm:
-            html += '<div class="overperm-grid">'
             for i, pd in enumerate(principals_detail):
                 name = pd.get("name", pd.get("arn", "").split("/")[-1])
                 arn = pd.get("arn", "")
                 ptype = "role" if ":role/" in arn else "user"
                 groups = pd.get("capability_groups", [])
-                top_group = groups[0].get("group", "Permissions") if groups else "Permissions"
-
                 hidden_class = "principals-hidden" if i >= show_limit else ""
-                html += f'''<div class="overperm-chip {hidden_class}" data-principal-idx="{fid}"
-                    onclick="copyArn(this.querySelector('.copy-arn-btn'),'{cls._escape_js(arn)}')" title="{cls._escape(arn)}">
-                    <div class="overperm-chip-icon">{'R' if ptype == 'role' else 'U'}</div>
-                    <div class="overperm-chip-info">
-                        <div class="overperm-chip-name">{cls._escape(name)}</div>
-                        <div class="overperm-chip-type">{cls._escape(top_group)}</div>
+                badges = "".join(
+                    f'<span class="badge {g.get("severity", "medium")}" style="font-size:8px;padding:2px 6px">'
+                    f'{cls._escape(g.get("group", "Permissions"))} ({len(g.get("actions", []))})</span>'
+                    for g in groups[:4]
+                )
+                evidence_html = ""
+                for ev in pd.get("evidence", []):
+                    source = {"group": "inherited from group", "inline": "inline policy", "admin": "AdministratorAccess"}.get(
+                        ev.get("source", "attached"), "attached policy")
+                    resources = ", ".join(ev.get("resources") or ["*"])
+                    conditions = ev.get("conditions") or {}
+                    condition_html = ""
+                    if conditions:
+                        condition_html = (f'<div style="font-size:9px;color:var(--hi);margin-top:3px">'
+                                          f'Condition: <code>{cls._escape(json.dumps(conditions, sort_keys=True))}</code></div>')
+                    evidence_html += f'''
+                        <div style="padding:8px 0;border-bottom:1px solid var(--bd)">
+                            <div style="font-size:11px"><code style="color:var(--cr)">{cls._escape(ev.get("action", ""))}</code>
+                            &larr; {cls._escape(ev.get("policy_name", "unnamed policy"))}
+                            <span style="color:var(--tx2)">({cls._escape(source)}{'; Sid ' + cls._escape(ev.get('sid', '')) if ev.get('sid') else ''})</span></div>
+                            <div style="font-size:10px;margin-top:3px"><strong>Resource:</strong> <code>{cls._escape(resources)}</code></div>
+                            {condition_html}
+                            <div style="font-size:10px;color:var(--tx2);margin-top:4px">{cls._escape(ev.get("explanation", ""))}</div>
+                        </div>'''
+                omitted = pd.get("evidence_omitted_count", 0)
+                if omitted:
+                    evidence_html += f'<div style="font-size:10px;color:var(--hi);margin-top:6px">+{omitted} additional tracked actions; inspect the JSON export and attached policies.</div>'
+                commands = "\n".join(pd.get("validation_commands", []))
+                command_html = (f'<details style="margin-top:8px"><summary style="font-size:10px;cursor:pointer">Read-only validation commands</summary>'
+                                f'<pre style="font-size:9px;white-space:pre-wrap;margin-top:6px">{cls._escape(commands)}</pre></details>') if commands else ""
+                caveats = []
+                if pd.get("permissions_boundary"):
+                    caveats.append("permissions boundary body unresolved; result may be overstated" if pd.get("boundary_capped")
+                                   else "permissions boundary included in the static action inventory")
+                if pd.get("has_notaction"):
+                    caveats.append("NotAction is present; review the full statement")
+                if pd.get("unresolved_managed"):
+                    caveats.append(f'{len(pd["unresolved_managed"])} managed-policy body/bodies unresolved; result may be understated')
+                caveat_html = f'<div style="font-size:9px;color:var(--hi);margin-top:6px">&#9888; {cls._escape("; ".join(caveats))}</div>' if caveats else ""
+                html += f'''<div class="principal-card {hidden_class}" data-principal-idx="{fid}">
+                    <div class="principal-card-left" style="align-items:flex-start">
+                        <div class="principal-card-icon {ptype}">{'R' if ptype == 'role' else 'U'}</div>
+                        <div class="principal-card-info" style="min-width:0">
+                            <div class="principal-card-name">{cls._escape(name)}</div>
+                            <div class="principal-card-arn">{cls._escape(arn)}</div>
+                            <div style="display:flex;flex-wrap:wrap;gap:4px;margin-top:6px">{badges}</div>
+                            <details style="margin-top:8px" {'open' if i < 3 else ''}>
+                                <summary style="font-size:10px;cursor:pointer">Why flagged: {pd.get('dangerous_action_count', len(pd.get('dangerous_actions', [])))} tracked high-impact action(s)</summary>
+                                <div style="border-left:2px solid var(--bd);padding-left:9px;margin-top:6px">{evidence_html}</div>
+                            </details>
+                            {caveat_html}{command_html}
+                        </div>
                     </div>
-                    <button class="copy-arn-btn" onclick="event.stopPropagation();copyArn(this,'{cls._escape_js(arn)}')" style="display:none">Copy</button>
+                    <div class="principal-card-actions"><button class="copy-arn-btn" onclick="event.stopPropagation();copyArn(this,'{cls._escape_js(arn)}')">Copy ARN</button></div>
                 </div>'''
-            html += '</div>'
 
             if len(principals_detail) > show_limit:
-                html += f'''<button class="show-more-btn" onclick="togglePrincipalsChips(this, '{fid}')" data-showing="false">
+                html += f'''<button class="show-more-btn" onclick="togglePrincipals(this, '{fid}')" data-showing="false">
                     Show {len(principals_detail) - show_limit} more principals
                 </button>'''
         else:
@@ -824,8 +930,9 @@ class HTMLExporter:
                 if evidence_html:
                     evidence_html = f'<div style="margin-top:6px;border-left:2px solid var(--bd);padding-left:8px">{evidence_html}</div>'
                 caveats = []
-                if pd.get("boundary_capped"):
-                    caveats.append("has a permissions boundary (effective access may be capped)")
+                if pd.get("permissions_boundary"):
+                    caveats.append("permissions boundary evaluated" if not pd.get("boundary_capped")
+                                   else "permissions boundary body unresolved; access may be overstated")
                 if pd.get("has_notaction"):
                     caveats.append("uses NotAction (review full grant manually)")
                 if pd.get("unresolved_managed"):
@@ -981,7 +1088,7 @@ class HTMLExporter:
         users = [r for r in results if r.get("type") == "user"]
         roles = [r for r in results if r.get("type") == "role"]
         all_arns = [r.get("principal", r.get("arn", "")) for r in results]
-        arns_json = json.dumps(all_arns).replace("'", "\\'")
+        arns_json = cls._json_for_script(all_arns).replace("'", "\\'")
 
         query_explanations = {
             "Administrative Principals": {
@@ -991,8 +1098,8 @@ class HTMLExporter:
             },
             "Privilege Escalation": {
                 "what": "Non-admin principals who can escalate to admin through one or more steps",
-                "why": "These are 'shadow admins' - they appear limited but can reach full access. Often overlooked in security reviews.",
-                "check": "Each of these principals is effectively an admin and should be treated as such."
+                "why": "The graph contains a path to full access that can be overlooked in attachment-only IAM reviews.",
+                "check": "Treat each as potentially admin-capable; validate conditions, SCPs/RCPs, session policies, and the current target trust before reporting."
             },
             "Secrets Access": {
                 "what": "Principals who can read secrets from Secrets Manager or SSM Parameter Store",
@@ -1092,17 +1199,24 @@ class HTMLExporter:
         technique_explanations = {
             "Direct STS AssumeRole": {
                 "what": "The attacker can directly assume a privileged IAM role using their current credentials.",
-                "why": "Trust policies allow the source principal to call sts:AssumeRole on the target role. This grants immediate access to the role's permissions without any additional steps.",
-                "impact": "Instant privilege escalation to the target role's full permission set.",
-                "verify_cli": "aws sts assume-role --role-arn <TARGET_ROLE_ARN> --role-session-name test-escalation",
+                "why": "A usable path requires both a compatible target trust policy and authorization for the caller's sts:AssumeRole request. The per-hop evidence below shows what was actually found.",
+                "impact": "A successful call returns a target-role session, subject to boundaries, session policies, SCPs and request conditions.",
+                "verify_cli": "aws iam simulate-principal-policy --policy-source-arn <SOURCE_PRINCIPAL_ARN> --action-names sts:AssumeRole --resource-arns <TARGET_ROLE_ARN>\naws iam get-role --role-name <TARGET_ROLE_NAME>",
                 "exploit_cli": "# After assuming the role, use the temporary credentials:\nexport AWS_ACCESS_KEY_ID=<AccessKeyId>\nexport AWS_SECRET_ACCESS_KEY=<SecretAccessKey>\nexport AWS_SESSION_TOKEN=<SessionToken>\naws sts get-caller-identity  # Verify you're now the target role"
             },
             "Lambda Function Abuse": {
                 "what": "The attacker can create or modify Lambda functions that execute with a privileged role.",
                 "why": "Having lambda:CreateFunction/UpdateFunctionCode with iam:PassRole allows creating functions that run with elevated privileges. The Lambda service assumes the execution role.",
                 "impact": "Code execution in the context of privileged roles, enabling arbitrary AWS API calls.",
-                "verify_cli": "aws lambda list-functions --query 'Functions[*].[FunctionName,Role]'\naws iam simulate-principal-policy --policy-source-arn <YOUR_ARN> --action-names lambda:CreateFunction iam:PassRole",
+                "verify_cli": "aws lambda list-functions --query 'Functions[*].[FunctionName,Role]'\naws iam simulate-principal-policy --policy-source-arn <SOURCE_PRINCIPAL_ARN> --action-names iam:PassRole --resource-arns <TARGET_ROLE_ARN>\naws iam simulate-principal-policy --policy-source-arn <SOURCE_PRINCIPAL_ARN> --action-names lambda:CreateFunction --resource-arns '*'",
                 "exploit_cli": "# Create a malicious Lambda that exfiltrates role credentials:\naws lambda create-function --function-name exploit-func \\\n  --runtime python3.9 --role <PRIVILEGED_ROLE_ARN> \\\n  --handler index.handler --zip-file fileb://exploit.zip\naws lambda invoke --function-name exploit-func output.txt"
+            },
+            "Lambda CreateFunction": {
+                "what": "The source may be able to configure Lambda to run code with the target execution role.",
+                "why": "A usable route requires resource-scoped iam:PassRole, function-creation permission, Lambda-compatible role trust, and a way to cause the function to execute. Review each prerequisite below.",
+                "impact": "Successfully executed function code receives the target role's session credentials and effective permissions.",
+                "verify_cli": "aws iam simulate-principal-policy --policy-source-arn <SOURCE_ARN> --action-names lambda:CreateFunction iam:PassRole --resource-arns <TARGET_ROLE_ARN>\naws iam get-role --role-name <TARGET_ROLE_NAME>",
+                "exploit_cli": "# In an explicitly authorized test account, validate with a benign function that calls only sts:GetCallerIdentity."
             },
             "EC2 Instance Profile": {
                 "what": "The attacker can launch EC2 instances with privileged instance profiles attached.",
@@ -1220,20 +1334,85 @@ class HTMLExporter:
             if len(tech_paths) > 10:
                 html += f'<p style="color:var(--tx2);font-size:11px;margin-top:8px">+{len(tech_paths) - 10} more paths</p>'
 
+            html += '<h4 style="margin-top:16px">Why these paths exist</h4>'
+            for path_index, path in enumerate(tech_paths[:10], 1):
+                html += f'''
+                <details style="margin:8px 0;border:1px solid var(--bd);border-radius:6px;padding:9px 11px">
+                    <summary style="cursor:pointer;color:var(--tx);font-size:12px;font-weight:600">
+                        Path {path_index}: <code>{cls._escape(path.source.name)}</code> &rarr; <code>{cls._escape(path.target.name)}</code>
+                    </summary>
+                    <p style="font-size:11px;color:{'var(--olive)' if not path.missing_prerequisites else 'var(--cr)'};margin:9px 0 4px">
+                        <strong>Evidence status:</strong> {cls._escape(path.evidence_status.replace('-', ' '))}. Live validation is still required.
+                    </p>
+                    <p style="font-size:12px;line-height:1.6;color:var(--tx2);margin:10px 0">{cls._escape(path.attack_narrative)}</p>
+                '''
+                if path.missing_prerequisites:
+                    html += '<div style="font-size:12px;color:var(--tx);font-weight:600">Missing local prerequisites</div><ul style="font-size:11px;line-height:1.6;color:var(--cr);margin:4px 0 8px 18px">'
+                    for prerequisite in path.missing_prerequisites:
+                        html += f'<li>{cls._escape(prerequisite)}</li>'
+                    html += '</ul>'
+                for hop in path.hop_explanations:
+                    html += f'''
+                    <div style="border-left:3px solid var(--hi);padding:7px 10px;margin:9px 0;background:var(--bg2)">
+                        <div style="font-size:12px;font-weight:600;color:var(--tx)">Step {hop["step"]}: {cls._escape(hop["mechanism"])}</div>
+                        <div style="font-size:11px;color:var(--tx2);margin-top:4px"><code>{cls._escape(hop["source"])}</code> &rarr; <code>{cls._escape(hop["target"])}</code></div>
+                        <p style="font-size:12px;line-height:1.55;color:var(--tx2);margin:7px 0"><strong style="color:var(--tx)">Why:</strong> {cls._escape(hop["why"])}</p>
+                        <p style="font-size:12px;line-height:1.55;color:var(--tx2);margin:7px 0"><strong style="color:var(--tx)">Graph proof:</strong> {cls._escape(hop["graph_evidence"].get("reason", ""))}</p>
+                    '''
+                    policy_evidence = hop.get("identity_policy_evidence", [])
+                    if policy_evidence:
+                        html += '<div style="font-size:12px;color:var(--tx);font-weight:600">Identity-policy evidence</div><ul style="font-size:11px;line-height:1.6;color:var(--tx2);margin:4px 0 6px 18px">'
+                        for evidence in policy_evidence:
+                            conditions = evidence.get("conditions") or {}
+                            condition_text = json.dumps(conditions, sort_keys=True) if conditions else "none"
+                            scope_label = "not-resources" if evidence.get("not_resources") else "resources"
+                            scope_value = evidence.get("not_resources") or evidence.get("resources", [])
+                            html += (
+                                f'<li><code>{cls._escape(evidence["action"])}</code> from '
+                                f'<code>{cls._escape(evidence["policy_name"])}</code> '
+                                f'({cls._escape(evidence["attachment_source"])}); {scope_label} '
+                                f'<code>{cls._escape(json.dumps(scope_value))}</code>; '
+                                f'conditions <code>{cls._escape(condition_text)}</code></li>'
+                            )
+                        html += '</ul>'
+                    else:
+                        html += '<p style="font-size:11px;color:var(--cr);margin:5px 0">No matching identity-policy statement was retained; validate this edge against the live policies.</p>'
+
+                    trust_evidence = hop.get("target_trust_evidence", [])
+                    if trust_evidence:
+                        html += '<div style="font-size:12px;color:var(--tx);font-weight:600">Target trust evidence</div><ul style="font-size:11px;line-height:1.6;color:var(--tx2);margin:4px 0 6px 18px">'
+                        for trust in trust_evidence:
+                            html += (
+                                f'<li>Principal <code>{cls._escape(json.dumps(trust.get("principal", {}), sort_keys=True))}</code>; '
+                                f'actions <code>{cls._escape(json.dumps(trust.get("actions", [])))}</code>; '
+                                f'conditions <code>{cls._escape(json.dumps(trust.get("conditions", {}), sort_keys=True))}</code></li>'
+                            )
+                        html += '</ul>'
+                    else:
+                        html += '<p style="font-size:11px;color:var(--olive);margin:5px 0">No matching target-trust statement was extracted; inspect the live role trust policy.</p>'
+                    html += f'''
+                        <p style="font-size:12px;line-height:1.55;color:var(--tx2);margin:7px 0"><strong style="color:var(--tx)">Access gained:</strong> {cls._escape(hop["access_gained"])}</p>
+                    </div>
+                    '''
+
+                html += f'''
+                    <div style="font-size:12px;line-height:1.6;color:var(--tx2);margin-top:9px"><strong style="color:var(--tx)">Result if successful:</strong> {cls._escape(path.resulting_access)}</div>
+                    <div style="font-size:12px;color:var(--tx);font-weight:600;margin-top:9px">Validate before reporting as exploitable</div>
+                    <ul style="font-size:11px;line-height:1.6;color:var(--tx2);margin:4px 0 2px 18px">
+                '''
+                for note in path.validation_notes:
+                    html += f'<li>{cls._escape(note)}</li>'
+                html += '</ul></details>'
+
             verify_cli = tech_info.get("verify_cli", "")
-            exploit_cli = tech_info.get("exploit_cli", "")
-            combined_cli = ""
-            if verify_cli:
-                combined_cli += verify_cli
-            if exploit_cli:
-                if combined_cli:
-                    combined_cli += "\n\n"
-                combined_cli += exploit_cli
+            # Reports contain non-mutating validation commands only. Abuse mechanics
+            # are explained in prose and per-hop evidence, not supplied as execution recipes.
+            combined_cli = verify_cli
 
             if combined_cli:
                 html += f'''
                 <details style="margin-top:12px">
-                    <summary style="cursor:pointer;color:var(--hi);font-size:12px;font-weight:500">Commands</summary>
+                    <summary style="cursor:pointer;color:var(--hi);font-size:12px;font-weight:500">Read-only validation commands</summary>
                     <div class="cli-block" style="margin-top:8px">
                         <div class="cli-block-header">
                             <button class="copy-btn" onclick="copyText(this)">Copy</button>
@@ -1357,11 +1536,11 @@ class HTMLExporter:
                         if action in DANGEROUS_ACTIONS or action == "*" or action.endswith(":*"):
                             dangerous_in_policy.append(action)
 
-                policy_json_str = json.dumps(policy_doc)
-                issues_json = json.dumps(dangerous_in_policy)
+                policy_json_str = cls._json_for_script(policy_doc)
+                issues_json = cls._json_for_script(dangerous_in_policy)
 
                 scripts.append(
-                    f"registerPolicy({json.dumps(policy_arn)}, {policy_json_str}, {issues_json});"
+                    f"registerPolicy({cls._json_for_script(policy_arn)}, {policy_json_str}, {issues_json});"
                 )
 
         if not scripts:
@@ -1467,6 +1646,8 @@ class HTMLExporter:
             "Identity policies: attached (customer + resolved AWS-managed), inline, and group-inherited",
             "Explicit Deny (broad, unconditional) is subtracted from Allow; NotAction is expanded",
             "Permissions boundaries: intersected when the body is available, otherwise the principal is flagged as boundary-capped",
+            "Ad-hoc queries evaluate Action/NotAction and Resource/NotResource wildcards against the requested resource",
+            "Escalation evidence uses PMapper authentication edges and preserves distinct paths up to five hops",
             "Trust policies: AWS, Federated (SAML/OIDC incl. GitHub Actions), and Service principals; ExternalId enforcement is verified, not just presence",
             "Credential hygiene: MFA, console password, and long-term access keys",
         ]
@@ -1474,9 +1655,9 @@ class HTMLExporter:
             "Service Control Policies (SCPs) and Resource Control Policies (RCPs) - org guardrails are NOT modeled; a finding may be capped by an SCP",
             "Resource-based policies (S3 bucket / KMS key / SNS policies) and session policies",
             "Runtime condition evaluation (source IP, aws:PrincipalTag, time) - conditions are noted, not simulated",
-            "Resource-level scoping for every action in 'who can do X' (IAM escalation actions ARE resource-checked; others are action-level)",
             "AWS-managed policy bodies not in the built-in catalog (flagged per-principal as 'unresolved' so capabilities are not silently understated)",
             "Access-key AGE and last-used, and unused permissions (collect from an IAM credential report / Access Analyzer to complete the assessment)",
+            "Escalation chains longer than five hops (the enumeration limit used to keep cyclic graphs tractable)",
         ]
         does_html = "".join(f"<li>{cls._escape(x)}</li>" for x in does)
         does_not_html = "".join(f"<li>{cls._escape(x)}</li>" for x in does_not)

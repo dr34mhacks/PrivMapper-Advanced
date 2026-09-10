@@ -20,17 +20,22 @@ Shubham Dubey. MIT licensed.
 __version__ = "2.0.0"
 
 import argparse
+import base64
 import csv
+import hashlib
 import json
 import os
 import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
+from fnmatch import fnmatchcase
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
@@ -105,6 +110,11 @@ class EscalationPath:
     blast_radius: int = 5
     mitre_techniques: List[Dict] = field(default_factory=list)
     attack_narrative: str = ""
+    hop_explanations: List[Dict[str, Any]] = field(default_factory=list)
+    resulting_access: str = ""
+    validation_notes: List[str] = field(default_factory=list)
+    evidence_status: str = "validation-required"
+    missing_prerequisites: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -120,6 +130,7 @@ class CrossAccountTrust:
     principal_kind: str = "AWS"
     external_id_enforced: bool = False
     target_is_admin: bool = False
+    target_is_privileged: bool = False
     reason: str = ""
     remediation_key: str = ""
 
@@ -165,7 +176,7 @@ class RunMetadata:
     regions_excluded: List[str] = field(default_factory=list)
     auto_detected_regions: bool = False
     run_timestamp: str = ""
-    tool_version: str = "1.0.0"
+    tool_version: str = "2.0.0"
     pmapper_version: str = ""
     output_directory: str = ""
     output_formats: List[str] = field(default_factory=list)
@@ -191,7 +202,7 @@ DANGEROUS_ACTIONS = {
     "sts:AssumeRole", "sts:AssumeRoleWithSAML", "sts:AssumeRoleWithWebIdentity",
     "secretsmanager:GetSecretValue", "ssm:GetParameter", "ssm:GetParameters",
     "ssm:GetParametersByPath", "ssm:SendCommand", "ssm:StartSession",
-    "s3:GetObject", "s3:PutBucketPolicy", "s3:PutObject",
+    "s3:GetObject", "s3:PutBucketPolicy", "s3:PutObject", "s3:DeleteObject",
     "ec2:RunInstances", "ec2:AssociateIamInstanceProfile",
     "lambda:CreateFunction", "lambda:UpdateFunctionCode",
     "lambda:UpdateFunctionConfiguration", "lambda:AddPermission", "lambda:InvokeFunction",
@@ -207,7 +218,7 @@ DANGEROUS_ACTIONS = {
     "ecs:RunTask", "ecs:RegisterTaskDefinition",
     "states:CreateStateMachine", "datapipeline:CreatePipeline",
     "cloudtrail:StopLogging", "cloudtrail:DeleteTrail",
-    "guardduty:DeleteDetector", "config:StopConfigurationRecorder",
+    "guardduty:DeleteDetector", "config:StopConfigurationRecorder", "kms:Decrypt",
 }
 
 
@@ -230,7 +241,7 @@ TECHNIQUE_PATTERNS = {
     "Trust Policy Modification": [r"UpdateAssumeRolePolicy", r"trust.*policy", r"trust document"],
     "Policy Attachment": [r"Attach.*Policy", r"Put.*Policy", r"attach.*administrator"],
     "Policy Version": [r"CreatePolicyVersion", r"SetDefaultPolicyVersion"],
-    "Lambda CreateFunction": [r"lambda:CreateFunction", r"create.*function.*role"],
+    "Lambda CreateFunction": [r"lambda:CreateFunction", r"lambda.*create.*function", r"create.*function.*role"],
     "Lambda UpdateFunctionCode": [r"lambda:UpdateFunctionCode", r"update.*function.*code"],
     "Lambda Configuration": [r"lambda:UpdateFunctionConfiguration"],
     "EC2 Instance Profile": [r"ec2:RunInstances.*PassRole", r"instance.*profile", r"ec2.*role"],
@@ -279,7 +290,7 @@ IAM_CHECKS = {
 S3_CHECKS = {"s3:GetObject", "s3:PutBucketPolicy", "s3:PutObject", "s3:DeleteObject"}
 
 
-CRED_CHECKS = {"secretsmanager:GetSecretValue", "ssm:GetParameter", "ssm:GetParameters", "ssm:GetParametersByPath"}
+CRED_CHECKS = {"secretsmanager:GetSecretValue", "ssm:GetParameter", "ssm:GetParameters", "ssm:GetParametersByPath", "kms:Decrypt"}
 
 
 EVASION_CHECKS = {"cloudtrail:StopLogging", "cloudtrail:DeleteTrail", "guardduty:DeleteDetector", "config:StopConfigurationRecorder"}
@@ -310,7 +321,7 @@ CHECK_LABEL = {
     "iam:PutRolePolicy":            "Write allow-all inline policies to any IAM role",
     "iam:PutGroupPolicy":           "Write allow-all inline policies to any IAM group",
     "iam:SetDefaultPolicyVersion":  "Revert managed policies to older permissive versions",
-    "iam:PassRole":                 "Pass privileged roles to EC2, Lambda, ECS, or other services",
+    "iam:PassRole":                 "Pass permitted IAM roles to AWS services (resource and conditions apply)",
     "iam:UpdateAssumeRolePolicy":   "Rewrite role trust policies to grant themselves access",
     "iam:CreatePolicyVersion":      "Create new policy versions with elevated permissions",
     "iam:AddUserToGroup":           "Add users to privileged groups",
@@ -323,10 +334,11 @@ CHECK_LABEL = {
     "s3:PutBucketPolicy":           "Rewrite S3 bucket policies to expose buckets publicly",
     "s3:PutObject":                 "Upload/overwrite any object in S3 buckets",
     "s3:DeleteObject":              "Delete any object from S3 buckets",
+    "kms:Decrypt":                  "Decrypt data protected by accessible KMS keys",
     "ec2:RunInstances":             "Launch EC2 instances with privileged instance profiles",
     "lambda:UpdateFunctionCode":    "Replace Lambda function code to abuse the execution role",
     "lambda:AddPermission":         "Grant external accounts access to Lambda functions",
-    "lambda:CreateFunction":        "Create new Lambda functions with a privileged execution role",
+    "lambda:CreateFunction":        "Create Lambda functions (execution-role use requires iam:PassRole)",
     "glue:CreateJob":               "Create Glue ETL jobs running with a privileged role",
     "glue:UpdateJob":               "Modify existing Glue jobs to run with a privileged role",
     "cloudformation:CreateStack":   "Deploy CloudFormation stacks under a privileged role",
@@ -426,25 +438,21 @@ EXPLOITATION_GUIDANCE = {
             "business": "Full account compromise, potential regulatory violations, data breach liability",
         },
         "exploitation_steps": [
-            "1. Obtain credentials for the admin principal (access keys, session tokens, or console access)",
-            "2. Verify admin access: aws sts get-caller-identity && aws iam list-attached-user-policies --user-name <NAME>",
-            "3. Enumerate sensitive data: aws s3 ls --recursive | grep -i secret",
-            "4. Extract secrets: aws secretsmanager list-secrets && aws secretsmanager get-secret-value --secret-id <ID>",
-            "5. Create backdoor access: aws iam create-user --user-name backdoor && aws iam attach-user-policy --user-name backdoor --policy-arn arn:aws:iam::aws:policy/AdministratorAccess",
+            "1. Confirm the principal and its current policy attachments",
+            "2. Simulate representative write, read, and delete actions against exact resources",
+            "3. Check permissions boundaries, SCPs, RCPs, resource policies, and session policy constraints",
+            "4. Treat full account takeover as the impact of credential compromise, not as proof that compromise occurred",
         ],
-        "aws_cli_commands": '''# Verify admin access
-aws sts get-caller-identity
-aws iam simulate-principal-policy --policy-source-arn <ARN> --action-names "*" --resource-arns "*"
+        "aws_cli_commands": '''# Inventory attached and inline policies (choose role or user)
+aws iam list-attached-role-policies --role-name <ROLE_NAME>
+aws iam list-role-policies --role-name <ROLE_NAME>
+aws iam list-attached-user-policies --user-name <USER_NAME>
+aws iam list-user-policies --user-name <USER_NAME>
 
-# Exfiltrate secrets
-aws secretsmanager list-secrets
-aws ssm get-parameters-by-path --path "/" --recursive --with-decryption
-
-# Create persistence
-aws iam create-access-key --user-name <ADMIN_USER>
-aws iam create-user --user-name attacker-backdoor
-aws iam attach-user-policy --user-name attacker-backdoor \\
-    --policy-arn arn:aws:iam::aws:policy/AdministratorAccess''',
+# Safely simulate representative actions; replace with exact actions/resources
+aws iam simulate-principal-policy --policy-source-arn <PRINCIPAL_ARN> \\
+    --action-names iam:CreateUser s3:DeleteBucket \\
+    --resource-arns <EXACT_RESOURCE_ARN>''',
         "evidence": "Look for attached policy: arn:aws:iam::aws:policy/AdministratorAccess",
         "references": [
             "https://docs.aws.amazon.com/IAM/latest/UserGuide/best-practices.html",
@@ -465,26 +473,18 @@ aws iam attach-user-policy --user-name attacker-backdoor \\
         },
         "exploitation_steps": [
             "1. Identify the escalation vector (iam:AttachRolePolicy, iam:PutUserPolicy, etc.)",
-            "2. Escalate privileges: aws iam attach-user-policy --user-name <SELF> --policy-arn arn:aws:iam::aws:policy/AdministratorAccess",
-            "3. Alternatively create a new policy version: aws iam create-policy-version --policy-arn <ARN> --policy-document file://admin-policy.json --set-as-default",
-            "4. Or modify role trust: aws iam update-assume-role-policy --role-name <ADMIN_ROLE> --policy-document file://trust-self.json",
-            "5. Assume escalated role or use new permissions",
+            "2. Confirm the exact target resource, policy ARN constraints, and Condition values",
+            "3. Verify any complementary permissions and target trust required by the modeled graph edge",
+            "4. Use policy simulation and configuration review; do not mutate a customer identity to prove impact",
         ],
-        "aws_cli_commands": '''# Method 1: Attach admin policy to self
-aws iam attach-user-policy --user-name $(aws sts get-caller-identity --query Arn --output text | cut -d'/' -f2) \\
-    --policy-arn arn:aws:iam::aws:policy/AdministratorAccess
+        "aws_cli_commands": '''# Inspect source policies and the target role without changing them
+aws iam list-attached-role-policies --role-name <SOURCE_ROLE_NAME>
+aws iam list-role-policies --role-name <SOURCE_ROLE_NAME>
+aws iam get-role --role-name <TARGET_ROLE_NAME>
 
-# Method 2: Create permissive policy version
-cat > /tmp/admin.json << 'EOF'
-{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"*","Resource":"*"}]}
-EOF
-aws iam create-policy-version --policy-arn <POLICY_ARN> --policy-document file:///tmp/admin.json --set-as-default
-
-# Method 3: Add self to admin role trust
-aws iam update-assume-role-policy --role-name AdminRole --policy-document '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"*"},"Action":"sts:AssumeRole"}]}'
-
-# Method 4: Create access keys for admin user
-aws iam create-access-key --user-name admin-user''',
+# Simulate the exact action and target ARN shown by the finding
+aws iam simulate-principal-policy --policy-source-arn <SOURCE_PRINCIPAL_ARN> \\
+    --action-names <EVIDENCED_ACTION> --resource-arns <TARGET_RESOURCE_ARN>''',
         "evidence": "Check for actions: iam:AttachRolePolicy, iam:AttachUserPolicy, iam:PutRolePolicy, iam:PutUserPolicy, iam:CreatePolicyVersion, iam:UpdateAssumeRolePolicy, iam:CreateAccessKey with Resource:*",
         "references": [
             "https://docs.aws.amazon.com/IAM/latest/UserGuide/best-practices.html#grant-least-privilege",
@@ -505,28 +505,17 @@ aws iam create-access-key --user-name admin-user''',
         },
         "exploitation_steps": [
             "1. Identify the escalation path and required permissions at each hop",
-            "2. Execute the first hop (e.g., assume role, create Lambda, launch EC2)",
-            "3. Continue through each hop until reaching the admin target",
+            "2. Validate each hop's source policy, resource scope, conditions, and target trust",
+            "3. Verify organization and resource guardrails that the static graph cannot prove",
             "4. Common patterns: iam:PassRole + service abuse, sts:AssumeRole chain, credential harvesting",
         ],
-        "aws_cli_commands": '''# STS AssumeRole escalation
-aws sts assume-role --role-arn <TARGET_ROLE_ARN> --role-session-name escalation
+        "aws_cli_commands": '''# Validate each identity-policy side of the path without executing it
+aws iam simulate-principal-policy --policy-source-arn <SOURCE_PRINCIPAL_ARN> \\
+    --action-names <HOP_ACTION> --resource-arns <HOP_TARGET_ARN>
 
-# Lambda function abuse (PassRole + CreateFunction)
-aws lambda create-function --function-name escalate \\
-    --runtime python3.9 --role <PRIVILEGED_ROLE_ARN> \\
-    --handler index.handler --zip-file fileb://payload.zip
-aws lambda invoke --function-name escalate output.txt
-
-# EC2 instance profile abuse
-aws ec2 run-instances --image-id ami-xxx --instance-type t2.micro \\
-    --iam-instance-profile Name=<PRIVILEGED_PROFILE> --user-data file://rev-shell.sh
-
-# CodeBuild project abuse
-aws codebuild create-project --name escalate --service-role <PRIVILEGED_ROLE_ARN> \\
-    --source type=NO_SOURCE --artifacts type=NO_ARTIFACTS \\
-    --environment type=LINUX_CONTAINER,image=aws/codebuild/standard:5.0,computeType=BUILD_GENERAL1_SMALL
-aws codebuild start-build --project-name escalate''',
+# For AssumeRole/PassRole paths, inspect target trust and attached policies
+aws iam get-role --role-name <TARGET_ROLE_NAME>
+aws iam list-attached-role-policies --role-name <TARGET_ROLE_NAME>''',
         "evidence": "Look for privilege escalation edges in the graph showing paths from user/role to admin",
         "references": [
             "https://github.com/nccgroup/PMapper",
@@ -545,22 +534,19 @@ aws codebuild start-build --project-name escalate''',
             "business": "Confused deputy attacks, unauthorized access from untrusted third parties",
         },
         "exploitation_steps": [
-            "1. For wildcard trust (Principal: '*'): Any AWS account can assume the role",
-            "2. Create an AWS account or use existing one, assume the target role",
-            "3. For trusts without ExternalId: If you control/compromise the trusted account, assume directly",
-            "4. After assumption, operate with the role's permissions",
+            "1. Determine exactly which external principal and STS action the trust permits",
+            "2. Evaluate every trust-policy Condition operator and value, not just key presence",
+            "3. Confirm the external principal also has identity-side permission where AWS requires it",
+            "4. Review the target role's effective permissions to establish the actual blast radius",
         ],
-        "aws_cli_commands": '''# Assume a role with wildcard trust from ANY AWS account
-aws sts assume-role --role-arn arn:aws:iam::<TARGET_ACCOUNT>:role/<WILDCARD_ROLE> \\
-    --role-session-name attacker-session
+        "aws_cli_commands": '''# Retrieve and review the URL-decoded role trust document
+aws iam get-role --role-name <TARGET_ROLE_NAME> \\
+    --query 'Role.AssumeRolePolicyDocument'
 
-# From a trusted account without ExternalId protection
-aws sts assume-role --role-arn arn:aws:iam::<TARGET_ACCOUNT>:role/<TRUSTED_ROLE> \\
-    --role-session-name legitimate-looking
-
-# After assuming, verify access
-aws sts get-caller-identity
-aws s3 ls  # Test data access''',
+# Validate an exported trust document with IAM Access Analyzer
+aws accessanalyzer validate-policy --policy-type RESOURCE_POLICY \\
+    --validate-policy-resource-type AWS::IAM::AssumeRolePolicyDocument \\
+    --policy-document file://trust-policy.json''',
         "evidence": "Check role trust policy for Principal: '*' or missing sts:ExternalId condition",
         "references": [
             "https://docs.aws.amazon.com/IAM/latest/UserGuide/confused-deputy.html",
@@ -569,10 +555,10 @@ aws s3 ls  # Test data access''',
         ],
     },
     "overly_permissive": {
-        "title": "Overly Permissive Permissions",
+        "title": "Potentially Overly Permissive Permissions",
         "risk_rating": "High",
         "cvss_estimate": "7.5 (High)",
-        "description": "Principals have permissions significantly broader than required for their function, increasing the blast radius of a credential compromise.",
+        "description": "Static policy evidence shows multiple high-impact permissions. The tool cannot know the principal's business need, so confirm job function and all authorization guardrails before reporting the access as excessive.",
         "impact": {
             "confidentiality": "Broader access than necessary increases exposure of sensitive data",
             "integrity": "More modification capabilities than job function requires",
@@ -581,12 +567,12 @@ aws s3 ls  # Test data access''',
         },
         "exploitation_steps": [
             "1. Identify the specific dangerous permissions granted (see capability list)",
-            "2. Exploit the most impactful permissions based on your objectives",
-            "3. Common high-impact actions: s3:GetObject (data exfil), secretsmanager:GetSecretValue (creds), lambda:InvokeFunction (code exec)",
+            "2. Confirm each permission against its exact Resource and Condition values",
+            "3. Use last-accessed evidence and business purpose to determine whether the permission is actually excessive",
         ],
-        "aws_cli_commands": '''# Enumerate what you can do
-aws iam simulate-principal-policy --policy-source-arn <ARN> \\
-    --action-names "s3:*" "iam:*" "secretsmanager:*" --resource-arns "*"
+        "aws_cli_commands": '''# Simulate only the exact action/resource reported for the principal
+aws iam simulate-principal-policy --policy-source-arn <PRINCIPAL_ARN> \\
+    --action-names <EVIDENCED_ACTION> --resource-arns <EVIDENCED_RESOURCE_ARN>
 
 # Use IAM Access Analyzer to validate policies
 aws accessanalyzer validate-policy --policy-type IDENTITY_POLICY \\
@@ -594,14 +580,7 @@ aws accessanalyzer validate-policy --policy-type IDENTITY_POLICY \\
 
 # Check last accessed information for unused permissions
 aws iam generate-service-last-accessed-details --arn <PRINCIPAL_ARN>
-aws iam get-service-last-accessed-details --job-id <JOB_ID>
-
-# Data exfiltration via S3
-aws s3 sync s3://<BUCKET>/ ./exfil/ --exclude "*" --include "*.pem" --include "*.key" --include "*secret*"
-
-# Credential harvesting
-aws secretsmanager get-secret-value --secret-id <SECRET_ID>
-aws ssm get-parameter --name <PARAM_NAME> --with-decryption''',
+aws iam get-service-last-accessed-details --job-id <JOB_ID>''',
         "evidence": "Review the capability groups and specific actions listed for each principal",
         "references": [
             "https://docs.aws.amazon.com/IAM/latest/UserGuide/best-practices.html#grant-least-privilege",
@@ -622,45 +601,38 @@ aws ssm get-parameter --name <PARAM_NAME> --with-decryption''',
             "business": "Credential theft enables access to databases, third-party services, and other systems",
         },
         "exploitation_steps": [
-            "1. List available secrets: aws secretsmanager list-secrets",
-            "2. Retrieve secret values: aws secretsmanager get-secret-value --secret-id <NAME>",
-            "3. List SSM parameters: aws ssm describe-parameters",
-            "4. Get parameter values: aws ssm get-parameter --name <NAME> --with-decryption",
-            "5. Use harvested credentials for lateral movement",
+            "1. Inventory secret and parameter metadata without retrieving values",
+            "2. Confirm the exact resource ARNs covered by each identity-policy statement",
+            "3. Check KMS key policies, resource policies, conditions, boundaries, and organization controls",
+            "4. Use policy simulation to validate authorization without exposing customer secrets",
         ],
-        "aws_cli_commands": '''# Enumerate and exfiltrate Secrets Manager
+        "aws_cli_commands": '''# Inventory secret metadata without retrieving secret values
 aws secretsmanager list-secrets --query 'SecretList[*].[Name,ARN]' --output table
-aws secretsmanager get-secret-value --secret-id <SECRET_NAME>
-
-# Enumerate and exfiltrate SSM Parameter Store
 aws ssm describe-parameters
-aws ssm get-parameters-by-path --path "/" --recursive --with-decryption
 
-# Bulk extraction
-for secret in $(aws secretsmanager list-secrets --query 'SecretList[*].Name' --output text); do
-    echo "=== $secret ===" >> secrets.txt
-    aws secretsmanager get-secret-value --secret-id $secret --query SecretString --output text >> secrets.txt 2>/dev/null
-done''',
+# Validate the exact secret read without retrieving any data
+aws iam simulate-principal-policy --policy-source-arn <PRINCIPAL_ARN> \\
+    --action-names secretsmanager:GetSecretValue --resource-arns <SECRET_ARN>''',
         "evidence": "Actions: secretsmanager:GetSecretValue, ssm:GetParameter, ssm:GetParameters, ssm:GetParametersByPath",
         "references": [
             "https://attack.mitre.org/techniques/T1552/005/",
         ],
     },
     "credential_hygiene": {
-        "title": "IAM Credential Hygiene",
-        "risk_rating": "High/Medium",
-        "cvss_estimate": "6.5 (Medium) - 8.1 (High for privileged no-MFA)",
-        "description": "IAM users with weak credential hygiene: console access without MFA, and/or long-lived access keys. These increase the likelihood and impact of credential compromise (phishing, key leakage in code/CI, credential stuffing).",
+        "title": "IAM Credential Review",
+        "risk_rating": "Context dependent",
+        "cvss_estimate": "",
+        "description": "IAM users with console access without MFA and/or active long-term access keys. Key presence alone does not prove age, exposure, non-use, or a policy violation; confirm with the credential report and last-used data.",
         "impact": {
             "confidentiality": "A phished password (no MFA) or a leaked long-term key grants the user's full permission set to an attacker",
             "integrity": "Compromised credentials allow modification of any resource the user can reach",
             "availability": "Attacker can lock out or disrupt using the compromised identity",
-            "business": "MFA absence on privileged users and unrotated static keys are the most common root cause of real cloud breaches and are flagged by CIS AWS Foundations benchmarks",
+            "business": "Actual risk depends on the principal's permissions, MFA applicability, key handling, age, and last-used evidence",
         },
         "exploitation_steps": [
-            "1. Obtain the user's console password (phishing/reuse) - no MFA means the password alone grants access",
-            "2. Or obtain a leaked long-term access key (source code, CI logs, laptop) - keys never expire until rotated",
-            "3. Authenticate and operate with the user's full permissions",
+            "1. Confirm whether the user has an active console password and MFA device",
+            "2. Collect access-key creation date, status, and last-used service/region/time",
+            "3. Determine whether each credential is required and handled according to company policy",
         ],
         "aws_cli_commands": '''# Identify users without MFA (validation)
 aws iam list-users --query 'Users[*].UserName' --output text | \\
@@ -680,17 +652,6 @@ aws iam get-access-key-last-used --access-key-id <AKIA...>''',
 }
 
 
-CVSS_VECTORS = {
-    "admin_access":        "CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:C/C:H/I:H/A:H (9.6 Critical)",
-    "shadow_admin":        "CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:C/C:H/I:H/A:H (9.6 Critical)",
-    "privesc":             "CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:C/C:H/I:H/A:H (9.6 Critical)",
-    "cross_account_trust": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:C/C:H/I:H/A:H (10.0 Critical for wildcard; lower with conditions)",
-    "overly_permissive":   "CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:H/A:L (8.1 High)",
-    "secrets_access":      "CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:C/C:H/I:N/A:N (7.7 High)",
-    "credential_hygiene":  "CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:U/C:H/I:H/A:L (7.3 High for privileged no-MFA)",
-}
-
-
 def get_exploitation_guidance(finding_category: str) -> Dict:
     """Get exploitation guidance for a finding category."""
     category_map = {
@@ -707,7 +668,8 @@ def get_exploitation_guidance(finding_category: str) -> Dict:
     }
     key = category_map.get(finding_category, "overly_permissive")
     guidance = dict(EXPLOITATION_GUIDANCE.get(key, EXPLOITATION_GUIDANCE["overly_permissive"]))
-    guidance["cvss_vector"] = CVSS_VECTORS.get(key, "")
+    guidance["cvss_estimate"] = ""
+    guidance["cvss_vector"] = ""
     return guidance
 
 
@@ -782,17 +744,6 @@ MANUAL_QUERIES = [
 
 AWS_MANAGED_POLICY_EXPANSIONS = {
     "AdministratorAccess": {"*"},
-    "IAMFullAccess": {"iam:*"},
-    "AdministratorAccess-Amplify": {"*"},
-    "AWSOrganizationsFullAccess": {"organizations:*"},
-    "AmazonS3FullAccess": {"s3:*"},
-    "AWSLambda_FullAccess": {"lambda:*"},
-    "AmazonEC2FullAccess": {"ec2:*"},
-    "SecretsManagerReadWrite": {"secretsmanager:*", "secretsmanager:GetSecretValue"},
-    "AmazonSSMFullAccess": {"ssm:*"},
-    "AWSCodeBuildAdminAccess": {"codebuild:*"},
-    "AWSCloudFormationFullAccess": {"cloudformation:*"},
-    "PowerUserAccess": {"__POWERUSER__"},
 }
 
 
@@ -807,20 +758,8 @@ def resolve_managed_policy_actions(policy_arn: str) -> Optional[Set[str]]:
         return None
     name = policy_arn.split("/")[-1]
 
-    if name in AWS_MANAGED_POLICY_EXPANSIONS:
-        actions = set(AWS_MANAGED_POLICY_EXPANSIONS[name])
-        if "__POWERUSER__" in actions:
-            actions = {a for a in DANGEROUS_ACTIONS if not a.startswith(("iam:", "organizations:"))}
-        return actions
-
-    m = re.match(r"^(?:Amazon|AWS)(.+?)_?FullAccess$", name)
-    if m:
-        return None
-
-    if re.search(r"(ReadOnly|ViewOnly)Access$", name):
-        return set()
-
-    return None
+    expansion = AWS_MANAGED_POLICY_EXPANSIONS.get(name)
+    return set(expansion) if expansion is not None else None
 
 
 class Colors:
@@ -867,6 +806,12 @@ class GraphLoader:
         edges = self._load_edges()
         policies = self._load_policies()
         members_by_group, policies_by_group = self._load_groups()
+
+        for principal in principals.values():
+            for group_arn in principal.group_memberships:
+                for policy_arn in policies_by_group.get(group_arn, []):
+                    if policy_arn not in principal.group_policy_arns:
+                        principal.group_policy_arns.append(policy_arn)
 
         for group_arn, members in members_by_group.items():
             gpols = policies_by_group.get(group_arn, [])
@@ -926,7 +871,8 @@ class GraphLoader:
                                        node.get("TrustPolicy",
                                                node.get("AssumeRolePolicyDocument")))
 
-                num_keys = node.get("num_access_keys", node.get("NumAccessKeys"))
+                num_keys = node.get("num_access_keys",
+                                    node.get("access_keys", node.get("NumAccessKeys")))
                 has_keys = node.get("has_access_keys", node.get("AccessKeys", None))
                 if isinstance(has_keys, list):
                     num_keys = num_keys if num_keys is not None else len(has_keys)
@@ -950,6 +896,15 @@ class GraphLoader:
                                          node.get("PermissionsBoundary"))
                 if isinstance(perm_boundary, dict):
                     perm_boundary = perm_boundary.get("arn", perm_boundary.get("PermissionsBoundaryArn"))
+
+                raw_groups = node.get("group_memberships", node.get("GroupMemberships", []))
+                if not isinstance(raw_groups, list):
+                    raw_groups = []
+                group_memberships = [
+                    group.get("arn", group.get("Arn", "")) if isinstance(group, dict) else group
+                    for group in raw_groups
+                ]
+                group_memberships = [group for group in group_memberships if group]
 
                 inline_policies = []
                 raw_inline = node.get("inline_policies", node.get("InlinePolicies", []))
@@ -981,6 +936,7 @@ class GraphLoader:
                     has_access_keys=bool(has_keys),
                     num_access_keys=num_keys,
                     is_instance_profile=is_instance_profile,
+                    group_memberships=group_memberships,
                     has_mfa=has_mfa,
                     active_password=active_password,
                     id_value=id_value,
@@ -989,7 +945,7 @@ class GraphLoader:
                 )
 
         except Exception as e:
-            print(f"[!] Error loading nodes.json: {e}")
+            raise ValueError(f"Invalid nodes.json: {e}") from e
 
         return principals
 
@@ -1018,7 +974,7 @@ class GraphLoader:
                     ))
 
         except Exception as e:
-            print(f"[!] Error loading edges.json: {e}")
+            raise ValueError(f"Invalid edges.json: {e}") from e
 
         return edges
 
@@ -1106,7 +1062,7 @@ class GraphLoader:
                 )
 
         except Exception as e:
-            print(f"[!] Error loading policies.json: {e}")
+            raise ValueError(f"Invalid policies.json: {e}") from e
 
         return policies
 
@@ -1148,19 +1104,35 @@ class GraphLoader:
                     ]
 
         except Exception as e:
-            print(f"[!] Error loading groups.json: {e}")
+            raise ValueError(f"Invalid groups.json: {e}") from e
 
         return members, group_policies
+
+
+def _pmapper_storage_roots() -> List[Path]:
+    """Return PMapper's platform storage root plus its legacy location."""
+    configured = os.environ.get("PMAPPER_STORAGE")
+    if configured:
+        return [Path(configured).expanduser()]
+
+    if sys.platform in ("win32", "cygwin") and os.environ.get("APPDATA"):
+        platform_root = Path(os.environ["APPDATA"]) / "principalmapper"
+    elif sys.platform == "darwin":
+        platform_root = (Path.home() / "Library" / "Application Support" /
+                         "com.nccgroup.principalmapper")
+    else:
+        data_home = os.environ.get("XDG_DATA_HOME")
+        platform_root = ((Path(data_home).expanduser() if data_home else
+                          Path.home() / ".local" / "share") / "principalmapper")
+
+    return list(dict.fromkeys([platform_root, Path.home() / ".principalmapper"]))
 
 
 def find_pmapper_graphs() -> List[Path]:
     """Auto-detect pmapper graph directories."""
     graphs = []
 
-    search_paths = [
-        Path.home() / ".local" / "share" / "principalmapper",
-        Path.home() / ".principalmapper",
-    ]
+    search_paths = _pmapper_storage_roots()
 
     for base in search_paths:
         if not base.exists():
@@ -1218,6 +1190,9 @@ def get_enabled_regions(profile: str) -> List[str]:
 class PMapperRunner:
     """Run pmapper commands and collect results."""
 
+    _account_locks: Dict[str, threading.Lock] = {}
+    _account_locks_guard = threading.Lock()
+
     def __init__(self, profile: str, output_dir: Path,
                  exclude_regions: str = EXCLUDE_REGIONS,
                  include_regions: Optional[List[str]] = None,
@@ -1227,12 +1202,14 @@ class PMapperRunner:
         self.exclude_regions = exclude_regions
         self.include_regions = include_regions
         self.auto_detect_regions = auto_detect_regions
-        self.profile_dir = output_dir / profile
+        safe_profile = re.sub(r"[^A-Za-z0-9_.-]+", "_", profile).strip(".") or "profile"
+        self.profile_dir = output_dir / safe_profile
         self.preset_dir = self.profile_dir / "presets"
         self.query_dir = self.profile_dir / "queries"
         self.regions_used: List[str] = []
         self.regions_excluded: List[str] = []
         self.used_auto_detect: bool = False
+        self.account_id_hint: str = ""
 
         for d in (self.profile_dir, self.preset_dir, self.query_dir):
             d.mkdir(parents=True, exist_ok=True)
@@ -1280,6 +1257,24 @@ class PMapperRunner:
             if label:
                 warn(f"  {label} ({ex})")
             return False, ""
+
+    def get_account_id_hint(self) -> str:
+        """Resolve the profile's account before graph creation when AWS CLI is available."""
+        try:
+            result = subprocess.run(
+                ["aws", "sts", "get-caller-identity", "--query", "Account",
+                 "--output", "text", "--profile", self.profile],
+                capture_output=True, text=True, timeout=30,
+            )
+            account_id = result.stdout.strip()
+            return account_id if result.returncode == 0 and account_id.isdigit() else ""
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            return ""
+
+    @classmethod
+    def _lock_for_account(cls, key: str) -> threading.Lock:
+        with cls._account_locks_guard:
+            return cls._account_locks.setdefault(key, threading.Lock())
 
     def create_graph(self) -> bool:
         """Create the pmapper graph for this profile."""
@@ -1379,11 +1374,7 @@ class PMapperRunner:
 
         self.run_command(["visualize", "--filetype", "svg"], label="SVG generation")
 
-        search_dirs = [
-            Path.home() / ".local" / "share" / "principalmapper",
-            Path.home() / ".principalmapper",
-            Path("."),
-        ]
+        search_dirs = _pmapper_storage_roots() + [Path(".")]
 
         found_svg = None
         for sdir in search_dirs:
@@ -1418,12 +1409,35 @@ class PMapperRunner:
             findings.append(line)
         return findings
 
+    def find_graph_path(self, account_id: str) -> Optional[Path]:
+        """Locate the JSON graph written by PMapper for this account."""
+        if not account_id or account_id == "unknown":
+            return None
+        roots = _pmapper_storage_roots()
+        candidates = [root / account_id / "graph" for root in roots]
+        for candidate in candidates:
+            if (candidate / "nodes.json").is_file() and (candidate / "edges.json").is_file():
+                return candidate
+        return None
+
     def run_full_analysis(self) -> Tuple[Dict[str, str], Dict[str, List[str]], Optional[Path]]:
         """Run complete pmapper analysis. Returns (stats, all_results, svg_path)."""
+        self.account_id_hint = self.get_account_id_hint()
+        lock_key = self.account_id_hint or f"profile:{self.profile}"
+        with self._lock_for_account(lock_key):
+            return self._run_full_analysis()
+
+    def _run_full_analysis(self) -> Tuple[Dict[str, str], Dict[str, List[str]], Optional[Path]]:
         if not self.create_graph():
             return {}, {}, None
 
         stats = self.get_graph_stats()
+        if self.account_id_hint and "account_id" not in stats:
+            stats["account_id"] = self.account_id_hint
+
+        if self.find_graph_path(stats.get("account_id", "")):
+            ok(f"Profile {self.profile} graph collection complete")
+            return stats, {}, None
 
         preset_results = self.run_preset_queries()
         manual_results = self.run_manual_queries()
@@ -1494,7 +1508,7 @@ class AnalysisEngine:
         """Find AWS-managed roles that are admins (expected but worth noting)."""
         managed = []
         for arn, principal in self.principals.items():
-            if principal.is_admin and self._is_aws_managed(principal.name):
+            if principal.is_admin and self._is_aws_managed(principal):
                 managed.append(principal)
         return managed
 
@@ -1545,14 +1559,9 @@ class AnalysisEngine:
     @staticmethod
     def _expand_action(action: str) -> Set[str]:
         """Return the subset of DANGEROUS_ACTIONS an Action string grants."""
-        if action == "*":
-            return set(DANGEROUS_ACTIONS)
-        if action.endswith(":*"):
-            service = action.split(":")[0]
-            return {d for d in DANGEROUS_ACTIONS if d.startswith(service + ":")}
-        if action in DANGEROUS_ACTIONS:
-            return {action}
-        return set()
+        pattern = str(action).lower()
+        return {candidate for candidate in DANGEROUS_ACTIONS
+                if fnmatchcase(candidate.lower(), pattern)}
 
     def _dangerous_covered_by_statement(self, stmt: PolicyStatement) -> Set[str]:
         """Dangerous actions a statement's Action/NotAction clause matches."""
@@ -1617,37 +1626,41 @@ class AnalysisEngine:
         """
         for arn, principal in self.principals.items():
             allow = {}
+            allow_candidates = defaultdict(list)
             deny = set()
-            principal.boundary_capped = bool(principal.permissions_boundary)
+            principal.boundary_capped = False
 
             for pol, source in self._effective_policies(principal):
                 for stmt in pol.statements:
-                    if stmt.effect == "Allow":
+                    if stmt.effect.lower() == "allow":
                         if stmt.not_actions:
                             principal.has_notaction = True
                         covered = self._dangerous_covered_by_statement(stmt)
                         for a in covered:
-                            if a not in allow:
-                                allow[a] = {
-                                    "policy": pol.arn,
-                                    "policy_name": pol.name,
-                                    "source": source,
-                                    "sid": stmt.sid,
-                                    "resources": list(stmt.resources) or (["<NotResource>"] if stmt.not_resources else ["*"]),
-                                    "conditions": bool(stmt.conditions),
-                                }
-                    elif stmt.effect == "Deny":
-                        broad = ("*" in stmt.resources) or bool(stmt.not_resources) or (not stmt.resources)
+                            item = {
+                                "policy": pol.arn,
+                                "policy_name": pol.name,
+                                "source": source,
+                                "sid": stmt.sid,
+                                "resources": list(stmt.resources) or (["<NotResource>"] if stmt.not_resources else ["*"]),
+                                "conditions": stmt.conditions,
+                            }
+                            allow_candidates[a].append(item)
+                            allow.setdefault(a, item)
+                    elif stmt.effect.lower() == "deny":
+                        broad = (("*" in stmt.resources) or (not stmt.resources)) and not stmt.not_resources
                         if broad and not stmt.conditions:
                             deny |= self._dangerous_covered_by_statement(stmt)
 
             if principal.is_admin:
                 for a in DANGEROUS_ACTIONS:
-                    allow.setdefault(a, {
+                    item = {
                         "policy": "arn:aws:iam::aws:policy/AdministratorAccess",
                         "policy_name": "AdministratorAccess",
-                        "source": "admin", "sid": "", "resources": ["*"], "conditions": False,
-                    })
+                        "source": "admin", "sid": "", "resources": ["*"], "conditions": {},
+                    }
+                    allow.setdefault(a, item)
+                    allow_candidates[a].append(item)
 
             dangerous = set(allow) - deny
 
@@ -1655,14 +1668,38 @@ class AnalysisEngine:
                 bpol = self.policies.get(principal.permissions_boundary)
                 bacts = None
                 if bpol:
-                    bacts = set()
+                    allow_statements = []
+                    bdeny = set()
                     for stmt in bpol.statements:
-                        if stmt.effect == "Allow":
-                            bacts |= self._dangerous_covered_by_statement(stmt)
+                        if stmt.effect.lower() == "allow":
+                            allow_statements.append(stmt)
+                        elif stmt.effect.lower() == "deny":
+                            broad = (("*" in stmt.resources) or (not stmt.resources)) and not stmt.not_resources
+                            if broad and not stmt.conditions:
+                                bdeny |= self._dangerous_covered_by_statement(stmt)
+                    bacts = set()
+                    for action in dangerous - bdeny:
+                        for evidence in allow_candidates.get(action, []):
+                            if any(
+                                action in self._dangerous_covered_by_statement(stmt)
+                                and self._resource_patterns_overlap(evidence.get("resources", ["*"]), stmt.resources)
+                                for stmt in allow_statements
+                            ):
+                                bacts.add(action)
+                                allow[action] = evidence
+                                break
                 else:
-                    bacts = resolve_managed_policy_actions(principal.permissions_boundary)
+                    resolved = resolve_managed_policy_actions(principal.permissions_boundary)
+                    if resolved is None:
+                        bacts = None
+                    else:
+                        bacts = set()
+                        for action_pattern in resolved:
+                            bacts |= self._expand_action(action_pattern)
                 if bacts is not None:
                     dangerous &= bacts
+                else:
+                    principal.boundary_capped = True
 
             principal.dangerous_actions = dangerous
             principal.action_evidence = {a: allow[a] for a in dangerous if a in allow}
@@ -1676,6 +1713,20 @@ class AnalysisEngine:
                 if action in CHECK_LABEL
             ]
 
+    @staticmethod
+    def _resource_patterns_overlap(identity_resources: List[str], boundary_resources: List[str]) -> bool:
+        left = identity_resources or ["*"]
+        right = boundary_resources or ["*"]
+        if "<NotResource>" in left:
+            return True
+        for identity_pattern in left:
+            for boundary_pattern in right:
+                if identity_pattern == "*" or boundary_pattern == "*":
+                    return True
+                if fnmatchcase(identity_pattern, boundary_pattern) or fnmatchcase(boundary_pattern, identity_pattern):
+                    return True
+        return False
+
     def _classify_capabilities(self, actions: Set[str]) -> List[Tuple[str, str, List[str]]]:
         """Classify actions into capability groups with severity."""
         groups = []
@@ -1688,12 +1739,12 @@ class AnalysisEngine:
 
         if iam_actions:
             if len(iam_actions) >= IAM_WILDCARD_THRESHOLD:
-                groups.append(("iam:*", "critical", sorted(iam_actions)))
+                groups.append(("IAM (broad tracked set)", "high", sorted(iam_actions)))
             else:
                 groups.append(("IAM (specific)", "high", sorted(iam_actions)))
 
         if s3_actions:
-            label = "s3:*" if s3_actions >= S3_CHECKS else "S3 (partial)"
+            label = "S3 (all tracked actions)" if s3_actions >= S3_CHECKS else "S3 (partial)"
             groups.append((label, "high", sorted(s3_actions)))
 
         if cred_actions:
@@ -1707,116 +1758,22 @@ class AnalysisEngine:
 
         return groups
 
-    def _has_wildcard_resource_for_action(self, principal: Principal, action: str) -> bool:
-        """Check if a principal has wildcard resource scope for a specific action.
-
-        This is important for distinguishing between:
-        - iam:CreateAccessKey on Resource: * (can create keys for any user - DANGEROUS)
-        - iam:CreateAccessKey on Resource: arn:aws:iam::*:user/${aws:username} (self only - not escalation)
-
-        Considers attached, inline, group-inherited, and resolved managed policies.
-        """
-        for policy, _source in self._effective_policies(principal):
-            for stmt in policy.statements:
-                if stmt.effect != "Allow":
-                    continue
-
-                action_matches = False
-                if stmt.not_actions:
-                    action_matches = action not in self._dangerous_covered_by_statement(
-                        PolicyStatement(effect="Allow", actions=list(stmt.not_actions), resources=[])
-                    ) and action not in stmt.not_actions
-                else:
-                    for stmt_action in stmt.actions:
-                        if stmt_action == "*" or stmt_action == action:
-                            action_matches = True
-                            break
-                        elif stmt_action.endswith(":*"):
-                            service = stmt_action.split(":")[0]
-                            if action.startswith(service + ":"):
-                                action_matches = True
-                                break
-
-                if not action_matches:
-                    continue
-
-                if stmt.not_resources and not stmt.resources:
-                    return True
-
-                for resource in stmt.resources:
-                    if resource == "*":
-                        return True
-                    if "${aws:username}" in resource or "${aws:userid}" in resource:
-                        continue
-                    if action.startswith("iam:"):
-                        if resource.endswith("/*") or resource.endswith(":*"):
-                            return True
-
-        return False
-
-    def _has_wildcard_passrole(self, principal: Principal) -> bool:
-        """Check if a principal can pass ANY role (Resource: *)."""
-        return self._has_wildcard_resource_for_action(principal, "iam:PassRole")
-
     def _find_shadow_admins(self) -> List[Principal]:
-        """Find principals with admin-equivalent permissions but no AdministratorAccess.
+        """Find non-admin principals with a PMapper-proven direct edge to admin.
 
-        A true shadow admin is one who has DIRECT escalation capabilities:
-        1. Can directly assume an admin role (1-hop sts:AssumeRole)
-        2. Has IAM-modifying permissions (iam:AttachRolePolicy, iam:CreateAccessKey, etc.)
-        3. Has iam:PassRole + compute permissions (can create Lambda/EC2/etc with admin role)
-
-        NOT someone who is just in a multi-hop escalation path.
+        Permission combinations alone are intentionally not promoted to shadow-admin:
+        exploitable IAM and PassRole techniques depend on the target, trust policy,
+        service conditions, and supporting permissions. PMapper's edge is the proof.
         """
         shadow = []
-
-        direct_escalation_actions = {
-            "iam:AttachUserPolicy", "iam:AttachRolePolicy", "iam:AttachGroupPolicy",
-            "iam:PutUserPolicy", "iam:PutRolePolicy", "iam:PutGroupPolicy",
-            "iam:CreatePolicyVersion", "iam:SetDefaultPolicyVersion",
-            "iam:UpdateAssumeRolePolicy", "iam:AddUserToGroup",
-        }
-
-        passrole_combo_actions = {
-            "lambda:CreateFunction", "lambda:UpdateFunctionCode",
-            "ec2:RunInstances", "cloudformation:CreateStack",
-            "codebuild:CreateProject", "glue:CreateJob",
-            "sagemaker:CreateNotebookInstance", "ecs:RunTask",
-        }
 
         for arn, principal in self.principals.items():
             if principal.is_admin:
                 continue
-            if self._is_aws_managed(principal.name):
+            if self._is_aws_managed(principal):
                 continue
 
-            can_assume_admin = False
-            for edge in self.edge_from.get(arn, []):
-                if edge.target in self.admins and "AssumeRole" in edge.short_reason:
-                    can_assume_admin = True
-                    break
-
-            if can_assume_admin:
-                shadow.append(principal)
-                continue
-
-            has_direct_iam = False
-            for iam_action in principal.dangerous_actions & direct_escalation_actions:
-                if self._has_wildcard_resource_for_action(principal, iam_action):
-                    has_direct_iam = True
-                    break
-
-            has_passrole = "iam:PassRole" in principal.dangerous_actions
-            has_wildcard_passrole = has_passrole and self._has_wildcard_passrole(principal)
-            has_compute = bool(principal.dangerous_actions & passrole_combo_actions)
-            has_passrole_combo = has_wildcard_passrole and has_compute
-
-            has_credential_theft = (
-                "iam:CreateAccessKey" in principal.dangerous_actions and
-                self._has_wildcard_resource_for_action(principal, "iam:CreateAccessKey")
-            )
-
-            if has_direct_iam or has_passrole_combo or has_credential_theft:
+            if any(edge.target in self.admins for edge in self.edge_from.get(arn, [])):
                 shadow.append(principal)
 
         return shadow
@@ -1853,7 +1810,7 @@ class AnalysisEngine:
                 continue
             if arn in exclude_arns:
                 continue
-            if self._is_aws_managed(principal.name):
+            if self._is_aws_managed(principal):
                 continue
 
             risk_score = self._calculate_permission_risk(principal)
@@ -1880,43 +1837,15 @@ class AnalysisEngine:
             "iam:UpdateAssumeRolePolicy", "iam:AddUserToGroup", "iam:CreateAccessKey",
         }
 
-        for policy_arn in principal.policies:
-            policy = self.policies.get(policy_arn)
-            if not policy:
-                continue
-
-            for stmt in policy.statements:
-                if stmt.effect != "Allow":
-                    continue
-
-                is_wildcard_resource = any(r == "*" for r in stmt.resources)
-                has_conditions = bool(stmt.conditions)
-
-                for action in stmt.actions:
-                    base_score = 0
-
-                    if action == "*":
-                        base_score = 10
-                    elif action in escalation_actions:
-                        base_score = 4
-                    elif action in DANGEROUS_ACTIONS:
-                        base_score = 2
-                    elif action.endswith(":*"):
-                        service = action.split(":")[0]
-                        if service == "iam":
-                            base_score = 5
-                        elif service in ["sts", "secretsmanager", "ssm"]:
-                            base_score = 3
-                        elif service in ["s3", "ec2", "lambda"]:
-                            base_score = 2
-
-                    if not is_wildcard_resource and base_score > 0:
-                        base_score = max(1, base_score - 1)
-
-                    if has_conditions and base_score > 0:
-                        base_score = max(1, base_score - 1)
-
-                    score += base_score
+        for action in principal.dangerous_actions:
+            evidence = principal.action_evidence.get(action, {})
+            base_score = 4 if action in escalation_actions else 2
+            resources = evidence.get("resources", ["*"])
+            if "*" not in resources:
+                base_score = max(1, base_score - 1)
+            if evidence.get("conditions"):
+                base_score = max(1, base_score - 1)
+            score += base_score
 
         return score
 
@@ -1927,7 +1856,7 @@ class AnalysisEngine:
         for arn, principal in self.principals.items():
             if principal.is_admin:
                 continue
-            if self._is_aws_managed(principal.name):
+            if self._is_aws_managed(principal):
                 continue
 
             admin_paths = self._find_paths_to_admin(arn)
@@ -1952,11 +1881,10 @@ class AnalysisEngine:
     def _find_paths_to_admin(self, start_arn: str) -> List[Tuple[str, List[Edge]]]:
         """BFS to find all paths from start to any admin."""
         results = []
-        queue = [(start_arn, [])]
-        visited = {start_arn}
+        queue = [(start_arn, [], {start_arn})]
 
         while queue:
-            current, path = queue.pop(0)
+            current, path, visited = queue.pop(0)
 
             for edge in self.edge_from.get(current, []):
                 if edge.target in visited:
@@ -1967,8 +1895,7 @@ class AnalysisEngine:
                 if edge.target in self.admins:
                     results.append((edge.target, new_path))
                 elif len(new_path) < 5:
-                    visited.add(edge.target)
-                    queue.append((edge.target, new_path))
+                    queue.append((edge.target, new_path, visited | {edge.target}))
 
         return results
 
@@ -1977,7 +1904,7 @@ class AnalysisEngine:
         if not hops:
             return "Unknown"
 
-        combined_reason = " ".join(h.reason for h in hops)
+        combined_reason = " ".join(f"{h.short_reason} {h.reason}" for h in hops)
 
         for technique, patterns in TECHNIQUE_PATTERNS.items():
             if any(re.search(p, combined_reason, re.I) for p in patterns):
@@ -2027,6 +1954,12 @@ class AnalysisEngine:
         path.mitre_techniques = get_mitre_for_technique(path.technique)
 
         path.attack_narrative = self._generate_attack_narrative(path)
+        path.hop_explanations = self._build_hop_explanations(path)
+        path.resulting_access = self._describe_resulting_access(path)
+        path.missing_prerequisites = self._find_missing_prerequisites(path)
+        path.evidence_status = ("required-local-evidence-present"
+                                if not path.missing_prerequisites else "incomplete-local-evidence")
+        path.validation_notes = self._build_path_validation_notes(path)
 
     def _generate_attack_narrative(self, path: EscalationPath) -> str:
         """Generate a human-readable attack narrative for the escalation path."""
@@ -2035,13 +1968,13 @@ class AnalysisEngine:
         target_name = path.target.name
 
         if source_type == "user":
-            narrative = f"An attacker who compromises the IAM user '{source_name}'"
+            narrative = f"The graph indicates that an attacker who compromises the IAM user '{source_name}'"
             if path.source.has_access_keys:
                 narrative += " (which has active access keys)"
         elif source_type == "role":
-            narrative = f"An attacker who can assume the role '{source_name}'"
+            narrative = f"The graph indicates that an attacker who can assume the role '{source_name}'"
         else:
-            narrative = f"An attacker with access to '{source_name}'"
+            narrative = f"The graph indicates that an attacker with access to '{source_name}'"
 
         if len(path.hops) == 1:
             hop = path.hops[0]
@@ -2053,11 +1986,178 @@ class AnalysisEngine:
                 narrative += f"  {i}. {hop.reason} -> {hop_target}\n"
 
         if path.target.is_admin:
-            narrative += "\nThis results in full administrative access to the AWS account, "
+            narrative += "\nIf the modeled steps remain valid in the live request context, this results in full administrative access to the AWS account, "
             narrative += "allowing the attacker to access all resources, exfiltrate data, "
             narrative += "create backdoors, and disable security controls."
 
         return narrative
+
+    @staticmethod
+    def _list_value(value: Any) -> List[Any]:
+        if value is None:
+            return []
+        return value if isinstance(value, list) else [value]
+
+    def _trust_evidence(self, target: Optional[Principal], mechanism: str,
+                        source_arn: str) -> List[Dict[str, Any]]:
+        """Return relevant role-trust statements without claiming live authorization."""
+        if not target or not isinstance(target.trust_policy, dict):
+            return []
+        statements = self._list_value(target.trust_policy.get("Statement", []))
+        evidence = []
+        for statement in statements:
+            if not isinstance(statement, dict) or statement.get("Effect", "").lower() != "allow":
+                continue
+            actions = [str(a) for a in self._list_value(statement.get("Action", []))]
+            if not any(fnmatchcase("sts:AssumeRole".lower(), a.lower()) for a in actions):
+                continue
+            principal = statement.get("Principal", {})
+            service_principal = {
+                "Lambda CreateFunction": "lambda.amazonaws.com",
+                "EC2 Instance Profile": "ec2.amazonaws.com",
+            }.get(mechanism)
+            if service_principal:
+                services = self._list_value(principal.get("Service", [])) if isinstance(principal, dict) else []
+                if service_principal not in services:
+                    continue
+            else:
+                aws_principals = self._list_value(principal.get("AWS", [])) if isinstance(principal, dict) else self._list_value(principal)
+                source_parts = source_arn.split(":")
+                source_account = source_parts[4] if len(source_parts) > 4 else ""
+                partition = source_parts[1] if len(source_parts) > 1 else "aws"
+                relevant = any(str(value) in {"*", source_arn, f"arn:{partition}:iam::{source_account}:root"}
+                               for value in aws_principals)
+                if not relevant:
+                    continue
+            evidence.append({
+                "effect": "Allow", "actions": actions, "principal": principal,
+                "conditions": statement.get("Condition", {}),
+            })
+        return evidence
+
+    def _policy_evidence(self, principal: Optional[Principal], actions: List[str],
+                         target_arn: str) -> List[Dict[str, Any]]:
+        if not principal:
+            return []
+        evidence = []
+        for action in actions:
+            if action not in principal.dangerous_actions:
+                continue
+            target_scoped = action in {"sts:AssumeRole", "iam:PassRole"}
+            for policy, source in self._effective_policies(principal):
+                for statement in policy.statements:
+                    if statement.effect.lower() != "allow" or action not in self._dangerous_covered_by_statement(statement):
+                        continue
+                    if target_scoped:
+                        resources = statement.resources or ["*"]
+                        if not any(fnmatchcase(target_arn, resource) for resource in resources):
+                            continue
+                        if any(fnmatchcase(target_arn, excluded) for excluded in statement.not_resources):
+                            continue
+                    evidence.append({
+                        "action": action, "policy_name": policy.name,
+                        "policy_arn": policy.arn, "attachment_source": source,
+                        "sid": statement.sid,
+                        "resources": list(statement.resources) or (["<NotResource>"] if statement.not_resources else ["*"]),
+                        "not_resources": list(statement.not_resources),
+                        "conditions": statement.conditions,
+                    })
+        return evidence
+
+    def _build_hop_explanations(self, path: EscalationPath) -> List[Dict[str, Any]]:
+        explanations = []
+        for step, hop in enumerate(path.hops, 1):
+            source = self.principals.get(hop.source)
+            target = self.principals.get(hop.target)
+            mechanism = self._classify_technique([hop])
+            if mechanism == "Direct STS AssumeRole":
+                actions = ["sts:AssumeRole"]
+                access = (f"A successful AssumeRole call returns a role session with the permissions of "
+                          f"'{target.name if target else hop.target}', subject to all applicable limits.")
+                why = ("PMapper generated an STS access edge. The call requires authorization to "
+                       "sts:AssumeRole and a compatible target role trust policy.")
+            elif mechanism == "Lambda CreateFunction":
+                actions = ["iam:PassRole", "lambda:CreateFunction", "lambda:InvokeFunction"]
+                access = (f"Code that is successfully run by Lambda uses the execution-role credentials "
+                          f"and permissions of '{target.name if target else hop.target}'.")
+                why = ("PMapper generated a Lambda edge. A usable path requires permission to pass this "
+                       "specific execution role, create/configure a function, cause it to run, and a target "
+                       "trust policy that permits lambda.amazonaws.com.")
+            elif mechanism == "EC2 Instance Profile":
+                actions = ["iam:PassRole", "ec2:RunInstances"]
+                access = "Workloads launched with the instance profile can obtain the target role's credentials through IMDS."
+                why = "PMapper generated an EC2 edge based on PassRole and workload-launch capability."
+            else:
+                actions = []
+                access = f"The modeled edge reaches '{target.name if target else hop.target}'."
+                why = "PMapper generated this access edge from the exported IAM relationship."
+
+            policy_evidence = self._policy_evidence(source, actions, hop.target)
+            trust_evidence = self._trust_evidence(target, mechanism, hop.source)
+            if not policy_evidence:
+                why += " No matching retained identity-policy statement was found, so the graph edge is the only local proof and must be checked live."
+            explanations.append({
+                "step": step, "source": hop.source, "target": hop.target,
+                "mechanism": mechanism, "why": why,
+                "graph_evidence": {"reason": hop.reason, "short_reason": hop.short_reason},
+                "identity_policy_evidence": policy_evidence,
+                "target_trust_evidence": trust_evidence, "access_gained": access,
+            })
+        return explanations
+
+    @staticmethod
+    def _describe_resulting_access(path: EscalationPath) -> str:
+        context = "role session or service execution context"
+        if path.target.is_admin:
+            return (f"If every hop succeeds, the source reaches the administrative {context} "
+                    f"'{path.target.name}'. This is modeled account-administrator access, not proof that "
+                    "a live request will succeed.")
+        return f"If every hop succeeds, the source reaches {context} '{path.target.name}'."
+
+    @staticmethod
+    def _find_missing_prerequisites(path: EscalationPath) -> List[str]:
+        missing = []
+        for hop in path.hop_explanations:
+            actions = {item.get("action") for item in hop.get("identity_policy_evidence", [])}
+            mechanism = hop.get("mechanism")
+            if mechanism == "Direct STS AssumeRole":
+                if "sts:AssumeRole" not in actions:
+                    missing.append(f"Step {hop['step']}: no target-scoped sts:AssumeRole Allow was retained.")
+                if not hop.get("target_trust_evidence"):
+                    missing.append(f"Step {hop['step']}: no relevant target role trust statement was extracted.")
+            elif mechanism == "Lambda CreateFunction":
+                for action in ("iam:PassRole", "lambda:CreateFunction"):
+                    if action not in actions:
+                        missing.append(f"Step {hop['step']}: no applicable {action} Allow was retained.")
+                if "lambda:InvokeFunction" not in actions:
+                    missing.append(f"Step {hop['step']}: no InvokeFunction Allow was retained; prove another permitted trigger can run the function.")
+                if not hop.get("target_trust_evidence"):
+                    missing.append(f"Step {hop['step']}: no Lambda service trust statement was extracted from the target role.")
+            elif mechanism == "EC2 Instance Profile":
+                for action in ("iam:PassRole", "ec2:RunInstances"):
+                    if action not in actions:
+                        missing.append(f"Step {hop['step']}: no applicable {action} Allow was retained.")
+                if not hop.get("target_trust_evidence"):
+                    missing.append(f"Step {hop['step']}: no EC2 service trust statement was extracted from the target role.")
+            else:
+                missing.append(f"Step {hop['step']}: technique-specific prerequisites are not parsed; rely on the PMapper edge only after live validation.")
+        return missing
+
+    @staticmethod
+    def _build_path_validation_notes(path: EscalationPath) -> List[str]:
+        notes = [
+            "Confirm the source credentials/session are usable and each referenced principal and resource still exists.",
+            "Evaluate SCPs, permissions boundaries, session policies, resource policies and all request-time conditions for every hop.",
+            "Treat the PMapper edge as static authorization evidence; validate with read-only simulation or an explicitly authorized test before reporting exploitability.",
+        ]
+        if any((e.get("conditions") or {}) for hop in path.hop_explanations
+               for e in hop.get("identity_policy_evidence", [])):
+            notes.append("At least one identity-policy Allow is conditional; the displayed condition must match the real request context.")
+        if any(hop.get("mechanism") == "Lambda CreateFunction" for hop in path.hop_explanations):
+            notes.append("For Lambda, confirm iam:PassedToService/resource scoping, execution-role trust, and a permitted trigger or InvokeFunction path.")
+        if len(path.hops) > 1:
+            notes.append("For this multi-hop route, repeat the authorization check from each newly obtained role session to the next target.")
+        return notes
 
     @staticmethod
     def _external_id_enforced(conditions: Dict) -> bool:
@@ -2078,6 +2178,26 @@ class AnalysisEngine:
                     if all(isinstance(x, str) and x and "*" not in x and "?" not in x for x in vals):
                         return True
         return False
+
+    @staticmethod
+    def _positive_condition_values(conditions: Dict, key_suffix: str, *, allow_like: bool = False) -> List[str]:
+        values = []
+        for operator, entries in (conditions or {}).items():
+            if not isinstance(entries, dict):
+                continue
+            op = operator.lower().split(":")[-1]
+            positive = op in {"stringequals", "arnequals", "bool"} or (allow_like and op in {"stringlike", "arnlike"})
+            if not positive:
+                continue
+            for key, value in entries.items():
+                if key.lower().endswith(key_suffix.lower()):
+                    values.extend(str(v) for v in (value if isinstance(value, list) else [value]))
+        return values
+
+    @classmethod
+    def _exact_condition_enforced(cls, conditions: Dict, key_suffix: str) -> bool:
+        values = cls._positive_condition_values(conditions, key_suffix)
+        return bool(values) and all(v and "*" not in v and "?" not in v for v in values)
 
     def _analyze_cross_account_trusts(self) -> List[CrossAccountTrust]:
         """Analyze role trust policies for external assumability.
@@ -2101,7 +2221,8 @@ class AnalysisEngine:
                 except Exception:
                     continue
 
-            target_is_admin = principal.is_admin or bool(principal.dangerous_actions)
+            target_is_admin = principal.is_admin
+            target_is_privileged = target_is_admin or bool(principal.dangerous_actions)
 
             statements = trust_doc.get("Statement", [])
             if isinstance(statements, dict):
@@ -2120,11 +2241,20 @@ class AnalysisEngine:
                 condition_str = json.dumps(conditions).lower()
                 has_external_id = "sts:externalid" in condition_str
                 external_id_enforced = self._external_id_enforced(conditions)
-                has_source = ("aws:sourcearn" in condition_str) or ("aws:sourceaccount" in condition_str)
-                has_org_id = "aws:principalorgid" in condition_str
-                has_principal_arn = "aws:principalarn" in condition_str
-                has_mfa = "aws:multifactorauthpresent" in condition_str
-                has_sub_aud = any(x in condition_str for x in (":sub", ":aud", "saml:aud", ":oaud"))
+                source_accounts = self._positive_condition_values(conditions, "aws:sourceaccount")
+                source_arns = self._positive_condition_values(conditions, "aws:sourcearn", allow_like=True)
+                has_source = (bool(source_accounts) and all(v.isdigit() and len(v) == 12 for v in source_accounts)) or \
+                    (bool(source_arns) and all(v.startswith("arn:") and not v.startswith("arn:*") for v in source_arns))
+                has_org_id = self._exact_condition_enforced(conditions, "aws:principalorgid")
+                has_principal_arn = self._exact_condition_enforced(conditions, "aws:principalarn")
+                mfa_values = self._positive_condition_values(conditions, "aws:multifactorauthpresent")
+                has_mfa = bool(mfa_values) and all(v.lower() == "true" for v in mfa_values)
+                sub_values = self._positive_condition_values(conditions, ":sub", allow_like=True)
+                aud_values = (self._positive_condition_values(conditions, ":aud") +
+                              self._positive_condition_values(conditions, ":oaud") +
+                              self._positive_condition_values(conditions, "saml:aud"))
+                has_sub = bool(sub_values)
+                has_aud = bool(aud_values)
 
                 aws_principals = principals_field.get("AWS", [])
                 if isinstance(aws_principals, str):
@@ -2157,11 +2287,12 @@ class AnalysisEngine:
                         elif has_external_id and not external_id_enforced:
                             risk, reason = "medium", "ExternalId present but NOT enforced (wildcard/Null/NotEquals) - confused-deputy risk"
                         else:
-                            risk, reason = "medium", "Specific external principal, no ExternalId - confused-deputy risk"
+                            risk, reason = "medium", "Specific external principal without an ExternalId (verify whether this is an owned or third-party account)"
 
-                    if target_is_admin and risk in ("medium", "high"):
-                        risk = "critical" if risk == "high" or is_wildcard else "high"
-                        reason += "; trusted-into role is ADMIN/privileged"
+                    if target_is_privileged and risk in ("medium", "high"):
+                        risk = "critical" if target_is_admin and (risk == "high" or is_wildcard) else "high"
+                        reason += ("; trusted-into role is ADMIN" if target_is_admin
+                                   else "; trusted-into role has dangerous permissions")
 
                     trusts.append(CrossAccountTrust(
                         role_arn=arn, role_name=principal.name,
@@ -2170,7 +2301,8 @@ class AnalysisEngine:
                         has_external_id=has_external_id, has_conditions=bool(conditions),
                         is_wildcard=is_wildcard, risk_level=risk,
                         principal_kind="AWS", external_id_enforced=external_id_enforced,
-                        target_is_admin=target_is_admin, reason=reason,
+                        target_is_admin=target_is_admin, target_is_privileged=target_is_privileged,
+                        reason=reason,
                         remediation_key="cross_account_wildcard" if is_wildcard else
                                         ("cross_account_no_external_id" if not external_id_enforced else ""),
                     ))
@@ -2184,28 +2316,30 @@ class AnalysisEngine:
                     is_github = "token.actions.githubusercontent.com" in fed_l
                     is_saml = ":saml-provider/" in fed_l
                     if is_github:
-                        if not has_sub_aud:
+                        github_aud = bool(aud_values) and all(v == "sts.amazonaws.com" for v in aud_values)
+                        if not has_sub and not github_aud:
                             risk = "critical"
                             reason = "GitHub Actions OIDC trust with NO sub/aud constraint - ANY GitHub repo can assume this role"
-                        elif ("*" in condition_str) or (":sub" not in condition_str):
+                        elif not has_sub or not github_aud or any(v in {"*", "repo:*"} or v.startswith("repo:*/") for v in sub_values):
                             risk = "high"
-                            reason = "GitHub Actions OIDC trust with a wildcard/under-constrained sub (branch/repo scoping too broad)"
+                            reason = "GitHub Actions OIDC trust with missing/under-constrained positive sub or aud restriction"
                         else:
                             risk = "low"
                             reason = "GitHub Actions OIDC trust scoped to a specific repo/branch via sub"
                     elif is_oidc:
-                        risk = "high" if not has_sub_aud else "low"
-                        reason = ("OIDC federated trust without sub/aud constraint" if not has_sub_aud
+                        risk = "high" if not (has_sub and has_aud) else "low"
+                        reason = ("OIDC federated trust without positive sub and aud constraints" if risk == "high"
                                   else "OIDC federated trust constrained by sub/aud")
                     elif is_saml:
-                        risk = "medium" if "saml:aud" not in condition_str else "low"
+                        risk = "medium" if not self._exact_condition_enforced(conditions, "saml:aud") else "low"
                         reason = ("SAML federated trust (verify IdP and saml:aud)" if risk != "low"
                                   else "SAML federated trust with audience restriction")
                     else:
                         risk, reason = "medium", "Federated trust to an external identity provider"
-                    if target_is_admin and risk in ("medium", "high"):
-                        risk = "critical" if risk == "high" else "high"
-                        reason += "; trusted-into role is ADMIN/privileged"
+                    if target_is_privileged and risk in ("medium", "high"):
+                        risk = "critical" if target_is_admin and risk == "high" else "high"
+                        reason += ("; trusted-into role is ADMIN" if target_is_admin
+                                   else "; trusted-into role has dangerous permissions")
                     trusts.append(CrossAccountTrust(
                         role_arn=arn, role_name=principal.name,
                         trusted_principal=str(fed),
@@ -2213,7 +2347,8 @@ class AnalysisEngine:
                         has_external_id=False, has_conditions=bool(conditions),
                         is_wildcard=False, risk_level=risk,
                         principal_kind="Federated", external_id_enforced=False,
-                        target_is_admin=target_is_admin, reason=reason,
+                        target_is_admin=target_is_admin, target_is_privileged=target_is_privileged,
+                        reason=reason,
                         remediation_key="federated_oidc",
                     ))
 
@@ -2226,7 +2361,7 @@ class AnalysisEngine:
                         continue
                     if has_source or has_org_id:
                         continue
-                    risk = "high" if target_is_admin else "medium"
+                    risk = "high" if target_is_privileged else "medium"
                     trusts.append(CrossAccountTrust(
                         role_arn=arn, role_name=principal.name,
                         trusted_principal=str(svc),
@@ -2234,7 +2369,7 @@ class AnalysisEngine:
                         has_external_id=False, has_conditions=bool(conditions),
                         is_wildcard=False, risk_level=risk,
                         principal_kind="Service", external_id_enforced=False,
-                        target_is_admin=target_is_admin,
+                        target_is_admin=target_is_admin, target_is_privileged=target_is_privileged,
                         reason=f"Service trust ({svc}) can act on behalf of other resources but is missing aws:SourceArn/aws:SourceAccount - cross-service confused-deputy risk",
                         remediation_key="service_confused_deputy",
                     ))
@@ -2251,7 +2386,52 @@ class AnalysisEngine:
         "secretsmanager:GetSecretValue", "ssm:GetParameter",
     ]
 
-    def _principal_evidence(self, p: Principal, limit: int = 6) -> List[Dict]:
+    @staticmethod
+    def _permission_explanation(action: str, resources: List[str], conditions: Any) -> str:
+        scope = "all resources supported by the action" if "*" in resources else \
+            f"the listed resource scope ({', '.join(resources[:2])}{' ...' if len(resources) > 2 else ''})"
+        caveat = " The statement is conditional; the shown condition must match at request time." if conditions else ""
+        if action == "iam:PassRole":
+            meaning = (f"Can pass {scope} to a compatible AWS service. This is not role assumption by itself; "
+                       "an allowed service API and a service trust relationship are also required.")
+        elif action.startswith("sts:AssumeRole"):
+            meaning = (f"The identity policy permits an STS role-assumption request against {scope}. "
+                       "The target role trust policy and any organization controls must also allow it.")
+        elif action.startswith("iam:Attach") or action.startswith("iam:Put"):
+            meaning = (f"Can modify permissions on {scope}. Escalation is possible only when that scope includes "
+                       "a usable identity and the requested policy operation is otherwise allowed.")
+        elif action in {"iam:CreatePolicyVersion", "iam:SetDefaultPolicyVersion"}:
+            meaning = (f"Can alter the effective version of {scope}. Impact depends on where that managed policy "
+                       "is attached and whether version limits and other controls permit the change.")
+        elif action in {"iam:CreateAccessKey", "iam:CreateLoginProfile", "iam:AddUserToGroup"}:
+            meaning = f"Can change credentials or membership for {scope}; this can provide access equal to the affected identity or group."
+        elif action in {"secretsmanager:GetSecretValue", "ssm:GetParameter", "ssm:GetParameters", "ssm:GetParametersByPath", "kms:Decrypt", "s3:GetObject"}:
+            meaning = f"Can read sensitive data from {scope}; resource policies, KMS authorization, and request context may further restrict access."
+        elif action.startswith(("lambda:", "ec2:", "codebuild:", "cloudformation:", "glue:", "ecs:", "sagemaker:")):
+            meaning = (f"Can invoke or modify compute/deployment functionality in {scope}. Privilege escalation additionally "
+                       "requires a usable execution role or an already privileged target and any supporting actions.")
+        else:
+            meaning = f"The collected identity-policy statement allows {action} against {scope}, subject to AWS's complete authorization evaluation."
+        return meaning + caveat
+
+    @staticmethod
+    def _validation_commands(p: Principal, evidence: List[Dict]) -> List[str]:
+        commands = []
+        for item in evidence[:3]:
+            resources = item.get("resources") or ["*"]
+            resource = next((r for r in resources if r != "<NotResource>"), "*")
+            commands.append(
+                "aws iam simulate-principal-policy "
+                f"--policy-source-arn '{p.arn}' --action-names '{item['action']}' "
+                f"--resource-arns '{resource}'"
+            )
+        entity_flag = "--role-name" if p.principal_type == "role" else "--user-name"
+        commands.append(f"aws iam list-attached-{p.principal_type}-policies {entity_flag} '{p.name}'")
+        commands.append(f"aws iam list-{p.principal_type}-policies {entity_flag} '{p.name}'")
+        commands.append(f"aws iam generate-service-last-accessed-details --arn '{p.arn}'")
+        return commands
+
+    def _principal_evidence(self, p: Principal, limit: int = 10) -> List[Dict]:
         """Concrete per-principal evidence: which policy/statement grants each dangerous
         action. This is what a report needs ('what exactly is the issue')."""
         ev = getattr(p, "action_evidence", {}) or {}
@@ -2260,14 +2440,18 @@ class AnalysisEngine:
         out = []
         for a in ordered[:limit]:
             e = ev[a]
+            resources = e.get("resources", ["*"])
+            conditions = e.get("conditions", {})
             out.append({
                 "action": a,
                 "policy": e.get("policy", ""),
                 "policy_name": e.get("policy_name", ""),
                 "source": e.get("source", "attached"),
                 "sid": e.get("sid", ""),
-                "resources": e.get("resources", ["*"]),
-                "conditional": e.get("conditions", False),
+                "resources": resources,
+                "conditions": conditions,
+                "conditional": bool(conditions),
+                "explanation": self._permission_explanation(a, resources, conditions),
             })
         return out
 
@@ -2276,7 +2460,7 @@ class AnalysisEngine:
         findings = []
 
         explicit_admins = [p for arn, p in self.principals.items()
-                         if p.is_admin and not self._is_aws_managed(p.name)]
+                         if p.is_admin and not self._is_aws_managed(p)]
         total_admins = len(self.admins)
         managed_admin_count = total_admins - len(explicit_admins)
         if explicit_admins:
@@ -2290,8 +2474,8 @@ class AnalysisEngine:
                             f"other {managed_admin_count} are AWS-managed/service roles reported separately below.)"),
                 principals=[p.arn for p in explicit_admins],
                 impact="Compromise of any of these credentials results in full account takeover.",
-                remediation="Review each admin principal. Replace AdministratorAccess with AWS managed job-function policies (PowerUserAccess, SystemAdministrator, etc.). "
-                           "Use IAM Access Analyzer to generate least-privilege policies based on actual access patterns. Enable MFA for all admin accounts. "
+                remediation="Review each admin principal and replace standing broad access with customer-managed least-privilege policies where practical. "
+                           "Use IAM Access Analyzer and CloudTrail activity to inform policy reduction. Require MFA for human administrative access. "
                            "Consider using AWS IAM Identity Center for centralized access management.",
                 details={
                     "principals_detail": [
@@ -2335,6 +2519,7 @@ class AnalysisEngine:
                     "dangerous_actions": dangerous_actions,
                     "capabilities": p.capabilities[:10],
                     "evidence": self._principal_evidence(p),
+                    "permissions_boundary": p.permissions_boundary,
                     "boundary_capped": p.boundary_capped,
                     "has_notaction": p.has_notaction,
                     "unresolved_managed": p.unresolved_managed,
@@ -2349,13 +2534,13 @@ class AnalysisEngine:
                 title="Shadow Administrators",
                 severity="critical",
                 category="iam",
-                description="These principals can escalate to admin privileges without having "
-                           "AdministratorAccess policy attached, making them invisible to standard IAM audits.",
+                description="The PMapper graph contains a direct access edge from each principal to an "
+                           "administrative principal even though AdministratorAccess is not attached directly. "
+                           "Validate runtime conditions and organization guardrails before reporting exploitation.",
                 principals=[p.arn for p in analysis.shadow_admins],
-                impact="Hidden administrative access that bypasses standard security reviews.",
-                remediation="Remove excessive permissions that enable privilege escalation. "
-                           "Implement IAM permissions boundaries to cap maximum permissions. "
-                           "Use AWS Organizations SCPs/RCPs for organization-wide guardrails. "
+                impact="If the modeled edge remains valid at runtime, compromise of the source principal can lead to administrative access.",
+                remediation="Remove or scope the policy/trust relationship that creates the proven edge. "
+                           "Use permissions boundaries and AWS Organizations SCPs/RCPs as additional guardrails, not as a substitute for removing unintended access. "
                            "Review with IAM Access Analyzer policy validation.",
                 details={"principals_detail": shadow_details},
             ))
@@ -2368,6 +2553,7 @@ class AnalysisEngine:
                 sev = "critical" if has_critical else "high" if has_high else "medium"
 
                 dangerous_actions = sorted(p.dangerous_actions)[:20] if p.dangerous_actions else []
+                evidence = self._principal_evidence(p)
                 op_details.append({
                     "arn": p.arn,
                     "name": p.name,
@@ -2377,7 +2563,11 @@ class AnalysisEngine:
                     "policies": p.policies[:10],
                     "dangerous_actions": dangerous_actions,
                     "capabilities": p.capabilities[:8],
-                    "evidence": self._principal_evidence(p),
+                    "evidence": evidence,
+                    "dangerous_action_count": len(p.dangerous_actions),
+                    "evidence_omitted_count": max(0, len(p.dangerous_actions) - len(evidence)),
+                    "validation_commands": self._validation_commands(p, evidence),
+                    "permissions_boundary": p.permissions_boundary,
                     "boundary_capped": p.boundary_capped,
                     "has_notaction": p.has_notaction,
                     "unresolved_managed": p.unresolved_managed,
@@ -2389,11 +2579,12 @@ class AnalysisEngine:
 
             findings.append(Finding(
                 id=f"{self.account_id}_overly_permissive",
-                title="Overly Permissive IAM Principals",
+                title="Potentially Overly Permissive IAM Principals",
                 severity="high",
                 category="iam",
-                description="These principals have permissions significantly broader than required, "
-                           "excluding those already reported as administrators or shadow admins.",
+                description="Static policy evidence shows multiple high-impact permissions on these principals, "
+                           "excluding those already reported as administrators or shadow admins. Confirm job function, "
+                           "request context, and organization/resource guardrails before concluding the access is excessive.",
                 principals=[p.arn for p in analysis.overly_permissive[:20]],
                 impact="Increased blast radius in case of credential compromise. "
                       "Each principal has dangerous capabilities listed below.",
@@ -2423,8 +2614,8 @@ class AnalysisEngine:
                 principals=[t.role_arn for t in risky_trusts],
                 impact="External or under-constrained principals may assume these roles. Where the role is "
                       "itself admin/privileged, this is a direct external path to account compromise.",
-                remediation="AWS principals: replace Principal:'*' with specific ARNs and add an ENFORCED "
-                           "sts:ExternalId (StringEquals with a secret value) or aws:PrincipalOrgID. "
+                remediation="AWS principals: replace Principal:'*' with specific ARNs. For owned accounts, consider aws:PrincipalOrgID; "
+                           "for third-party delegation, use an enforced, provider-assigned sts:ExternalId. "
                            "Federated/OIDC: constrain the sub/aud (for GitHub Actions pin repo:ORG/REPO:ref:...). "
                            "Service trusts: add aws:SourceArn/aws:SourceAccount to prevent confused-deputy abuse.",
                 details={"trusts": [asdict(t) for t in risky_trusts]},
@@ -2438,15 +2629,15 @@ class AnalysisEngine:
                 title="IAM Credential Hygiene (MFA / Access Keys)",
                 severity=worst,
                 category="credential_hygiene",
-                description="IAM users with weak credential hygiene: console access without MFA and/or "
-                           "long-lived access keys. These are the most common root causes of real cloud "
-                           "account compromise and are core CIS AWS Foundations checks.",
+                description="IAM users requiring credential review: console access without MFA and/or "
+                           "active long-term access keys. An active key is inventory evidence, not proof "
+                           "that the key is old, unused, exposed, or improperly managed.",
                 principals=[c["arn"] for c in analysis.credential_hygiene],
                 impact="A phished password without MFA, or a leaked static access key, grants an attacker the "
                       "user's full permission set. Privileged users without MFA are the highest priority.",
-                remediation="Enforce MFA for all IAM users with console access (SCP/permission-boundary deny "
-                           "when aws:MultiFactorAuthPresent is false). Replace long-term access keys with "
-                           "short-lived credentials (IAM Identity Center / roles); rotate or delete unused keys.",
+                remediation="Enforce MFA for IAM users with console access. Prefer short-lived credentials "
+                           "through IAM Identity Center or roles; use a credential report and last-used data "
+                           "before deciding whether an active access key should be rotated or deleted.",
                 details={"issues": analysis.credential_hygiene},
             ))
 
@@ -2457,10 +2648,10 @@ class AnalysisEngine:
                 title="Critical Privilege Escalation Paths",
                 severity="critical",
                 category="privesc",
-                description=f"Found {len(critical_paths)} paths where non-admin principals can "
-                           "escalate to full administrative access.",
+                description=f"PMapper modeled {len(critical_paths)} critical paths from non-admin "
+                           "principals to full administrative access. Validate runtime conditions and external guardrails.",
                 principals=sorted(set(p.source.arn for p in critical_paths[:20])),
-                impact="Attackers with access to these principals can gain full account control.",
+                impact="If a modeled path is executable in the live request context, compromise of its source can lead to full account control.",
                 remediation="Remove or restrict permissions that enable escalation. Use permissions boundaries to limit maximum permissions. "
                            "Common fixes include: restricting iam:PassRole to specific roles, "
                            "adding resource conditions to sts:AssumeRole, limiting ec2:RunInstances.",
@@ -2472,9 +2663,9 @@ class AnalysisEngine:
 
         return findings
 
-    def _is_aws_managed(self, name: str) -> bool:
-        """Check if name matches AWS-managed resource patterns."""
-        return any(re.search(p, name) for p in AWS_MANAGED_PATTERNS)
+    def _is_aws_managed(self, principal: Principal) -> bool:
+        """Identify AWS service-linked roles from their reserved ARN path."""
+        return ":role/aws-service-role/" in principal.arn.lower()
 
 
 class RemediationEngine:
@@ -2508,8 +2699,8 @@ class RemediationEngine:
 }''',
         },
         "cross_account_no_external_id": {
-            "issue": "Cross-account trust without ExternalId is vulnerable to confused deputy attacks",
-            "fix": "Add sts:ExternalId condition to the trust policy",
+            "issue": "External trust requires ownership and purpose validation; ExternalId is specifically relevant to third-party delegation",
+            "fix": "For third parties, require a unique provider-assigned ExternalId. For owned accounts, prefer specific principals and organization-aware controls where appropriate",
             "example": '''{
     "Effect": "Allow",
     "Principal": {"AWS": "arn:aws:iam::TRUSTED_ACCOUNT:root"},
@@ -2536,8 +2727,8 @@ class RemediationEngine:
 }''',
         },
         "lambda_abuse": {
-            "issue": "Lambda function permissions allow code injection via role assumption",
-            "fix": "Restrict lambda:UpdateFunctionCode and lambda:CreateFunction to specific functions",
+            "issue": "A PMapper edge indicates Lambda can be used to access a more privileged execution role",
+            "fix": "Restrict Lambda mutation/invocation permissions and iam:PassRole; ensure only Lambda-compatible, least-privileged roles can be passed",
             "example": '''{
     "Effect": "Allow",
     "Action": ["lambda:UpdateFunctionCode"],
@@ -2565,9 +2756,7 @@ class RemediationEngine:
 aws iam generate-service-last-accessed-details --arn <PRINCIPAL_ARN>
 aws accessanalyzer start-policy-generation --policy-generation-details '{"principalArn":"<PRINCIPAL_ARN>"}'
 
-# Use AWS managed job-function policies:
-# - ViewOnlyAccess, PowerUserAccess, SystemAdministrator, DatabaseAdministrator
-# - Create custom policies using Access Analyzer recommendations''',
+# Create customer-managed policies from validated Access Analyzer and CloudTrail evidence.''',
         },
         "permissions_boundary": {
             "issue": "No permissions boundary limits the maximum permissions for delegated principals",
@@ -2658,7 +2847,7 @@ aws accessanalyzer start-policy-generation --policy-generation-details '{"princi
         """Get specific remediation for a cross-account trust issue."""
         if trust.is_wildcard:
             return cls.REMEDIATIONS["cross_account_wildcard"]
-        elif not trust.has_external_id:
+        elif not trust.has_external_id and trust.principal_kind == "AWS":
             return cls.REMEDIATIONS["cross_account_no_external_id"]
         else:
             return {
@@ -2686,17 +2875,19 @@ class CrossAccountAnalyzer:
         trust_chains = self._find_trust_chains()
         if trust_chains:
             findings.append(Finding(
-                id="cross_account_chain",
-                title="Cross-Account Trust Chains",
-                severity="high",
+                id="cross_account_trust_topology",
+                title="Cross-Account Trust Topology (Validation Required)",
+                severity="medium",
                 category="cross_account",
-                description=f"Found {len(trust_chains)} trust chains spanning multiple accounts.",
+                description=(f"Found {len(trust_chains)} multi-account trust sequences. Trust relationships "
+                             "alone do not prove that a principal can traverse the sequence; identity permissions, "
+                             "target trust conditions, SCPs/RCPs, boundaries, and session policies must also align."),
                 principals=[],
-                impact="Compromise of one account may lead to lateral movement across accounts.",
+                impact="A sequence may enable lateral movement only when the required AssumeRole authorization is confirmed at every hop.",
                 remediation="Review and minimize cross-account trust relationships. "
-                           "Implement strong external ID requirements. "
+                           "Use ExternalId for third-party confused-deputy scenarios and organization conditions for owned accounts where appropriate. "
                            "Consider using AWS Organizations SCPs to restrict cross-account access.",
-                details={"chains": trust_chains},
+                details={"chains": trust_chains, "proven_traversable": False},
             ))
 
         trust_counts = defaultdict(list)
@@ -2919,7 +3110,7 @@ class QueryEngine:
         "privesc": {
             "name": "Privilege Escalation Paths",
             "description": "Find all principals that can escalate to admin",
-            "filter": lambda p, qe: not p.is_admin and any(e.target in qe.admins for e in qe.edge_from.get(p.arn, [])),
+            "filter": lambda p, qe: p.arn in qe.privesc_sources,
         },
         "admin": {
             "name": "Administrative Principals",
@@ -2929,7 +3120,7 @@ class QueryEngine:
         "shadow": {
             "name": "Shadow Administrators",
             "description": "Principals that can become admin without being admin",
-            "filter": lambda p, qe: not p.is_admin and any(e.target in qe.admins for e in qe.edge_from.get(p.arn, [])),
+            "filter": lambda p, qe: p.arn in qe.shadow_admin_arns,
         },
         "cross-account": {
             "name": "Cross-Account Access",
@@ -2976,6 +3167,8 @@ class QueryEngine:
                 self.admins.add(principal.arn)
             for action in principal.dangerous_actions:
                 self.action_to_principals[action].add(principal.arn)
+        self.privesc_sources = {path.source.arn for path in self.analysis.escalation_paths}
+        self.shadow_admin_arns = {principal.arn for principal in self.analysis.shadow_admins}
 
     @staticmethod
     def _has_cross_account_trust(principal) -> bool:
@@ -2996,9 +3189,13 @@ class QueryEngine:
         """
         results = []
 
-        query_lower = query_str.lower().strip()
+        query_text = query_str.strip()
 
-        match = re.match(r"who can do ([a-z0-9:*]+)(?:\s+with\s+(.+))?", query_lower)
+        match = re.match(
+            r"who can do ([a-z0-9:*?]+)(?:\s+with\s+(.+))?",
+            query_text,
+            re.IGNORECASE,
+        )
         if match:
             action = match.group(1)
             resource = match.group(2) if match.group(2) else "*"
@@ -3012,40 +3209,20 @@ class QueryEngine:
     def _query_action(self, action: str, resource: str = "*") -> List[Dict]:
         """Find all principals that can perform an action."""
         results = []
-        action_lower = action.lower()
 
         for principal in self.analysis.principals.values():
-            can_do = False
+            can_do = self._can_directly_do(principal, action, resource)
             matched_via = None
-            actions = principal.dangerous_actions
-
-            if principal.is_admin:
-                can_do = True
-                matched_via = "admin (*)"
-            elif action_lower in [a.lower() for a in actions]:
-                can_do = True
-                matched_via = "direct"
-
-            elif "*" in actions or "iam:*" in actions:
-                can_do = True
-                matched_via = "wildcard (*)"
-
-            else:
-                service = action_lower.split(":")[0] if ":" in action_lower else ""
-                service_wildcard = f"{service}:*"
-                if service_wildcard.lower() in [a.lower() for a in actions]:
-                    can_do = True
-                    matched_via = f"service wildcard ({service_wildcard})"
+            if can_do:
+                matched_via = "admin (*)" if principal.is_admin else "direct"
 
             if not can_do:
-                for edge in self.edge_from.get(principal.arn, []):
-                    target = self.analysis.principals.get(edge.target)
-                    if target:
-                        target_actions = target.dangerous_actions
-                        if action_lower in [a.lower() for a in target_actions] or "*" in target_actions:
-                            can_do = True
-                            matched_via = f"indirect via {edge.target.split('/')[-1]}"
-                            break
+                access_path = self._find_access_path(principal.arn, action, resource)
+                if access_path:
+                    can_do = True
+                    target_name = access_path[-1].target.split("/")[-1]
+                    count = len(access_path)
+                    matched_via = f"indirect via {target_name} ({count} hop{'s' if count != 1 else ''})"
 
             if can_do:
                 results.append({
@@ -3058,6 +3235,95 @@ class QueryEngine:
                 })
 
         return sorted(results, key=lambda x: (not x["direct"], x["name"]))
+
+    def _find_access_path(self, start_arn: str, action: str, resource: str):
+        """Return the shortest graph path to a principal that can do the action."""
+        queue = [(start_arn, [])]
+        visited = {start_arn}
+        while queue:
+            current, path = queue.pop(0)
+            for edge in self.edge_from.get(current, []):
+                if edge.target in visited:
+                    continue
+                visited.add(edge.target)
+                new_path = path + [edge]
+                target = self.analysis.principals.get(edge.target)
+                if target and self._can_directly_do(target, action, resource):
+                    return new_path
+                queue.append((edge.target, new_path))
+        return []
+
+    @staticmethod
+    def _action_matches(statement, action: str) -> bool:
+        requested = action.lower()
+        if statement.not_actions:
+            return not any(fnmatchcase(requested, pattern.lower())
+                           for pattern in statement.not_actions)
+        return any(fnmatchcase(requested, pattern.lower()) for pattern in statement.actions)
+
+    @staticmethod
+    def _resource_matches(statement, resource: str) -> bool:
+        if resource == "*":
+            if statement.not_resources:
+                return not any(pattern == "*" for pattern in statement.not_resources)
+            return bool(statement.resources)
+        if statement.not_resources:
+            return not any(fnmatchcase(resource, pattern) for pattern in statement.not_resources)
+        return any(fnmatchcase(resource, pattern) for pattern in statement.resources)
+
+    def _effective_policies(self, principal):
+        policies = []
+        seen = set()
+        for policy_arn in list(principal.policies) + list(principal.group_policy_arns):
+            if not policy_arn or policy_arn in seen:
+                continue
+            seen.add(policy_arn)
+            policy = self.analysis.policies.get(policy_arn)
+            if policy:
+                policies.append(policy)
+                continue
+            actions = resolve_managed_policy_actions(policy_arn)
+            if actions is not None:
+                policies.append(Policy(
+                    arn=policy_arn,
+                    name=policy_arn.split("/")[-1],
+                    statements=[PolicyStatement("Allow", sorted(actions), ["*"])],
+                    is_aws_managed=True,
+                ))
+        policies.extend(principal.inline_policies)
+        return policies
+
+    def _policy_set_allows(self, policies, action: str, resource: str) -> bool:
+        allowed = False
+        for policy in policies:
+            for statement in policy.statements:
+                if not self._action_matches(statement, action):
+                    continue
+                if not self._resource_matches(statement, resource):
+                    continue
+                effect = statement.effect.lower()
+                if effect == "allow":
+                    allowed = True
+                elif effect == "deny" and not statement.conditions:
+                    if resource == "*" and not (
+                        "*" in statement.resources and not statement.not_resources
+                    ):
+                        continue
+                    return False
+        return allowed
+
+    def _can_directly_do(self, principal, action: str, resource: str) -> bool:
+        policies = self._effective_policies(principal)
+        identity_allowed = self._policy_set_allows(policies, action, resource)
+        if principal.is_admin:
+            identity_allowed = True
+        if not identity_allowed:
+            return False
+        if principal.permissions_boundary:
+            boundary = self.analysis.policies.get(principal.permissions_boundary)
+            if boundary and not self._policy_set_allows([boundary], action, resource):
+                return False
+        return True
 
     def run_preset(self, preset_name: str) -> List[Dict]:
         """Run a preset query."""
@@ -3118,7 +3384,6 @@ class QueryEngine:
 
 
 CSS = """
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap');
 :root{
   /* Black & Olive Green Theme - Gen Z Edition */
   --bg:#0a0a0a;--bg2:#111111;--bg3:#181818;--bg4:#222222;
@@ -3133,7 +3398,8 @@ CSS = """
   --purple:#a78bfa;--purple2:#1e1a2e;--purple3:#3b2f5a;
   --sidebar:#0a0a0a;--sidebar-text:#8a8a8a;
   --olive:#84a98c;--olive-dark:#52796f;--olive-light:#cad2c5;--olive-bright:#a4c3ac;
-  --mono:'JetBrains Mono',monospace;--body:'Inter',sans-serif;
+  --mono:'JetBrains Mono',ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,'Liberation Mono',monospace;
+  --body:'Inter',-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;
   --shadow-sm:0 1px 2px rgba(0,0,0,0.3);
   --shadow:0 2px 8px rgba(0,0,0,0.4),0 1px 3px rgba(0,0,0,0.3);
   --shadow-lg:0 8px 24px rgba(0,0,0,0.5),0 4px 8px rgba(0,0,0,0.3);
@@ -3233,7 +3499,7 @@ h1,h2,h3,h4{color:var(--txb);font-weight:700;letter-spacing:-0.02em}
 .finding-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:20px;margin-bottom:20px}
 .finding-grid:last-child{margin-bottom:0}
 @media(max-width:1200px){.finding-grid{grid-template-columns:1fr}.findings-grid{grid-template-columns:1fr}.query-grid{grid-template-columns:repeat(auto-fill,minmax(250px,1fr))}.overperm-grid{grid-template-columns:repeat(auto-fill,minmax(180px,1fr))}.run-info-grid{grid-template-columns:1fr}}
-@media(max-width:900px){.sidebar{display:none}.main-wrapper{margin-left:0}.header{padding:16px 20px}.main{padding:20px}.summary-grid{grid-template-columns:repeat(2,1fr)}.principal-controls{flex-direction:column;align-items:stretch}.filter-group{justify-content:center}.export-group{justify-content:center}.site-footer{left:0!important}.graph-canvas{height:400px!important}}
+@media(max-width:900px){.sidebar{display:none}.main-wrapper{margin-left:0}.header{padding:16px 20px}.main{padding:20px}.summary-grid{grid-template-columns:repeat(2,1fr)}.principal-controls{flex-direction:column;align-items:stretch}.filter-group{justify-content:center}.export-group{justify-content:center}.graph-canvas{height:400px!important}}
 @media(max-width:600px){.summary-grid{grid-template-columns:1fr}.header-title{font-size:18px}.finding-section h4{font-size:9px}.badge{font-size:8px;padding:3px 8px}.site-footer{flex-direction:column;gap:8px;text-align:center}.escalation-table{font-size:11px}.escalation-table th,.escalation-table td{padding:8px 6px}}
 
 /* Tables - Responsive */
@@ -3528,7 +3794,7 @@ h1,h2,h3,h4{color:var(--txb);font-weight:700;letter-spacing:-0.02em}
 .run-info-toggle:hover{text-decoration:underline}
 
 /* Site Footer */
-.site-footer{position:fixed;bottom:0;left:240px;right:0;background:rgba(10,10,10,0.95);backdrop-filter:blur(8px);border-top:1px solid var(--bd);padding:12px 24px;display:flex;justify-content:space-between;align-items:center;font-size:11px;z-index:100;color:var(--tx2)}
+.site-footer{background:rgba(10,10,10,0.95);border-top:1px solid var(--bd);padding:12px 24px;display:flex;justify-content:space-between;align-items:center;font-size:11px;color:var(--tx2)}
 .site-footer a{color:var(--olive);text-decoration:none}
 .site-footer a:hover{text-decoration:underline}
 
@@ -4662,6 +4928,62 @@ class HTMLExporter:
 
     JS = _APP_JS
 
+    CYTOSCAPE_SHA256 = "92d752b48ea949720675865197fd2a0001c95bc5888545e990af60321712d4c6"
+    FONT_MANIFEST = (
+        ("inter-400.ttf", "Inter", 400, "1b08e7fc267a5c7e1d614100f604b83e7e8a0be241f0f288faa2b3ac93a683ba"),
+        ("inter-500.ttf", "Inter", 500, "8c883f63b2c4157d997319f2c8bc6995ed4357ef371940d31ca159004a4aae63"),
+        ("inter-600.ttf", "Inter", 600, "e7a1aaf7eda9f2fad4131725fa556265ec75ca7b2d756260173a040363e8d4f7"),
+        ("inter-700.ttf", "Inter", 700, "b37284b5701b6b168dfc770aa1a4ac492106422fd3ba76bc7641e37434e8019c"),
+        ("inter-800.ttf", "Inter", 800, "eec66af7f2337bd34fe6e801cf92ededcb57a20c0d7bc40a61d4eefcbe3dd40c"),
+        ("jetbrains-mono-400.ttf", "JetBrains Mono", 400, "44ce4a84f20d60f24539bd0cef11f79c29e38609e0f8adf18551c9794a5d9dc3"),
+        ("jetbrains-mono-500.ttf", "JetBrains Mono", 500, "3386a05f6ece969e4537de6be894170d20558e82f7d56c8c5d332972ef172160"),
+        ("jetbrains-mono-600.ttf", "JetBrains Mono", 600, "df54dbfafba61d4911eb3dab9bba2d20531fb009f01d64dd42fa96ab862584d8"),
+    )
+
+    @classmethod
+    def _cytoscape_js(cls) -> str:
+        """Load and integrity-check the pinned local graph library."""
+        script_dir = Path(__file__).resolve().parent
+        candidates = [
+            script_dir / "src" / "privmapper" / "reporting" / "vendor" / "cytoscape-3.28.1.min.js",
+            script_dir / "vendor" / "cytoscape-3.28.1.min.js",
+        ]
+        asset = next((path for path in candidates if path.is_file()), None)
+        if asset is None:
+            raise RuntimeError("vendored Cytoscape asset is missing; keep vendor/cytoscape-3.28.1.min.js beside privmapper.py")
+        payload = asset.read_bytes()
+        digest = hashlib.sha256(payload).hexdigest()
+        if digest != cls.CYTOSCAPE_SHA256:
+            raise RuntimeError(f"vendored Cytoscape integrity check failed: {digest}")
+        return payload.decode("utf-8")
+
+    @classmethod
+    def _font_css(cls) -> str:
+        font_dir = Path(__file__).resolve().parent / "src" / "privmapper" / "reporting" / "vendor" / "fonts"
+        if not font_dir.is_dir():
+            font_dir = Path(__file__).resolve().parent / "vendor" / "fonts"
+        rules = []
+        for filename, family, weight, expected in cls.FONT_MANIFEST:
+            payload = (font_dir / filename).read_bytes()
+            if hashlib.sha256(payload).hexdigest() != expected:
+                raise RuntimeError(f"vendored font integrity check failed: {filename}")
+            encoded = base64.b64encode(payload).decode("ascii")
+            rules.append(
+                f"@font-face{{font-family:'{family}';font-style:normal;font-weight:{weight};font-display:swap;"
+                f"src:url(data:font/ttf;base64,{encoded}) format('truetype');}}"
+            )
+        return "".join(rules)
+
+    @staticmethod
+    def _json_for_script(value) -> str:
+        """Serialize data without allowing it to terminate an HTML script block."""
+        return (json.dumps(value)
+                .replace("&", "\\u0026")
+                .replace("<", "\\u003c")
+                .replace(">", "\\u003e")
+                .replace("\u2028", "\\u2028")
+                .replace("\u2029", "\\u2029"))
+
     @classmethod
     def export(cls, analyses: List[AccountAnalysis], cross_account_findings: List[Finding],
                output_path: Path, run_metadata: Optional[RunMetadata] = None):
@@ -4679,18 +5001,22 @@ class HTMLExporter:
         ) + sum(1 for f in cross_account_findings if f.severity == "critical")
 
         graph_data = cls._build_graph_data(analyses)
-        graph_json = json.dumps(graph_data)
+        graph_json = cls._json_for_script(graph_data)
 
         policy_scripts = cls._generate_policy_scripts(analyses)
+        cytoscape_js = cls._cytoscape_js()
+        font_css = cls._font_css()
 
         html = f"""<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="referrer" content="no-referrer">
+    <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data: blob:; font-src data:; connect-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'">
     <title>IAM Security Report - {run_date}</title>
-    <style>{cls.CSS}</style>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/cytoscape/3.28.1/cytoscape.min.js"></script>
+    <style>{font_css}{cls.CSS}</style>
+    <script>{cytoscape_js}</script>
 </head>
 <body>
     <!-- Sidebar Navigation -->
@@ -4700,7 +5026,7 @@ class HTMLExporter:
                 <div class="sidebar-logo-icon">&#9733;</div>
                 PrivMapper
             </div>
-            <div class="sidebar-version">Advanced v1.0</div>
+            <div class="sidebar-version">Advanced v2.0</div>
         </div>
         <nav class="sidebar-nav">
             <div class="sidebar-section">Overview</div>
@@ -4815,7 +5141,7 @@ class HTMLExporter:
                     <div style="padding:40px;text-align:center;color:var(--tx2);background:var(--bg2);border-radius:var(--radius-lg);border:1px dashed var(--bd)">
                         <div style="font-size:32px;margin-bottom:12px">&#10004;</div>
                         <div style="font-size:14px;font-weight:600;color:var(--ok)">No Critical Findings</div>
-                        <div style="font-size:12px;margin-top:8px">Great job! No critical security issues detected.</div>
+                        <div style="font-size:12px;margin-top:8px">No critical issue was detected in the supplied graph. Review the methodology limits before treating this as assurance.</div>
                     </div>"""
 
         html += """
@@ -4951,7 +5277,6 @@ class HTMLExporter:
                     <tbody>
 """
             shadow_arns = {p.arn for p in analysis.shadow_admins}
-            overperm_arns = {p.arn for p in analysis.overly_permissive}
             for arn, principal in sorted(analysis.principals.items(), key=lambda x: (not x[1].is_admin, x[1].name)):
                 is_shadow = arn in shadow_arns
                 cap_count = len(principal.dangerous_actions) if principal.dangerous_actions else 0
@@ -4999,8 +5324,18 @@ class HTMLExporter:
 """
 
         html += f"""
-            <div style="height:60px"></div><!-- Spacer for fixed footer -->
         </div><!-- End main -->
+        <footer class="site-footer">
+            <div>
+                Made with <span style="color:#e94560">&hearts;</span> by
+                <a href="https://github.com/dr34mhacks" target="_blank" rel="noopener noreferrer">Sid</a>
+            </div>
+            <div>
+                Built on the shoulders of
+                <a href="https://github.com/nccgroup/PMapper" target="_blank" rel="noopener noreferrer">PMapper</a>
+                by NCC Group
+            </div>
+        </footer>
     </div><!-- End main-wrapper -->
 
     <script>{cls.JS}</script>
@@ -5055,18 +5390,6 @@ class HTMLExporter:
         </div>
     </div>
 
-    <!-- Footer -->
-    <footer class="site-footer">
-        <div>
-            Made with <span style="color:#e94560">&hearts;</span> by
-            <a href="https://github.com/dr34mhacks" target="_blank">Sid</a>
-        </div>
-        <div>
-            Built on the shoulders of
-            <a href="https://github.com/nccgroup/PMapper" target="_blank">PMapper</a>
-            by NCC Group
-        </div>
-    </footer>
 </body>
 </html>"""
 
@@ -5233,13 +5556,13 @@ class HTMLExporter:
         if refs:
             refs_html = '<div style="margin-top:12px;font-size:11px;color:var(--tx2)"><strong>References:</strong><br>'
             for ref in refs:
-                refs_html += f'<a href="{cls._escape(ref)}" target="_blank" style="color:var(--primary);text-decoration:none">{cls._escape(ref)}</a><br>'
+                refs_html += f'<a href="{cls._escape(ref)}" target="_blank" rel="noopener noreferrer" style="color:var(--primary);text-decoration:none">{cls._escape(ref)}</a><br>'
             refs_html += '</div>'
 
         cvss = guidance.get("cvss_estimate", "")
         cvss_vector = guidance.get("cvss_vector", "")
         cvss_html = f'<span style="font-family:var(--mono);font-size:10px;color:var(--cr);margin-left:8px">{cls._escape(cvss)}</span>' if cvss else ""
-        cvss_vector_html = (f'<p style="font-size:11px;margin-top:6px"><strong>CVSS v3.1:</strong> '
+        cvss_vector_html = (f'<p style="font-size:11px;margin-top:6px"><strong>Suggested contextual CVSS v3.1 (validate scope):</strong> '
                             f'<code style="font-size:10px">{cls._escape(cvss_vector)}</code></p>') if cvss_vector else ""
 
         how_to_report = cls._render_how_to_report(finding, guidance, cvss, cvss_vector)
@@ -5273,13 +5596,13 @@ class HTMLExporter:
                             {principals_html}
                         </div>
                         <div class="finding-section">
-                            <h4>Exploitation Steps</h4>
+                            <h4>Potential Abuse Scenario (validate prerequisites)</h4>
                             {exploit_html if exploit_html else f'<p style="font-size:12px;color:var(--tx2)">See AWS CLI commands below</p>'}
                         </div>
                     </div>
                     <div class="finding-section" style="margin-top:16px">
-                        <h4>AWS CLI Commands (Proof of Concept)</h4>
-                        <p style="font-size:11px;color:var(--tx2);margin-bottom:8px">Commands for validating or exploiting this finding:</p>
+                        <h4>AWS CLI Validation / Controlled Proof of Concept</h4>
+                        <p style="font-size:11px;color:var(--tx2);margin-bottom:8px">These commands are non-mutating validation aids. Supply the exact resource and required context values; simulator output can differ from live authorization.</p>
                         {cli_html if cli_html else '<p style="font-size:12px;color:var(--tx2);font-style:italic">No specific commands available</p>'}
                     </div>
                     <div class="finding-grid" style="margin-top:16px">
@@ -5305,18 +5628,31 @@ class HTMLExporter:
     def _render_how_to_report(cls, finding, guidance, cvss, cvss_vector) -> str:
         """A copy-paste report skeleton so the security team can lift a finding straight
         into an assessment deliverable."""
-        title = cls._escape(finding.title)
         sev = finding.severity.upper()
         n = len(finding.principals)
         affected = chr(10).join(finding.principals[:25])
         if len(finding.principals) > 25:
             affected += f"\n... (+{len(finding.principals) - 25} more)"
         evidence = guidance.get("evidence", "See affected principals and their attached policies.")
+        principal_evidence = []
+        for pd in finding.details.get("principals_detail", [])[:5]:
+            rows = []
+            for ev in pd.get("evidence", [])[:4]:
+                resource = ", ".join(ev.get("resources") or ["*"])
+                condition = json.dumps(ev.get("conditions") or {}, sort_keys=True)
+                rows.append(
+                    f"  - {ev.get('action', '')} via {ev.get('policy_name', '')}; "
+                    f"Resource={resource}; Condition={condition or '{}'}"
+                )
+            if rows:
+                principal_evidence.append(f"{pd.get('arn', pd.get('name', ''))}:\n" + "\n".join(rows))
+        if principal_evidence:
+            evidence += "\n\nCollected policy evidence (top 5 principals / 4 actions each):\n" + "\n".join(principal_evidence)
         remediation = finding.remediation
         report_text = (
             f"Title: {finding.title}\n"
             f"Severity: {sev}" + (f"  |  {cvss}" if cvss else "") + "\n"
-            + (f"CVSS: {cvss_vector}\n" if cvss_vector else "")
+            + (f"Suggested contextual CVSS (validate scope): {cvss_vector}\n" if cvss_vector else "")
             + f"\nDescription:\n{guidance.get('description', finding.description)}\n"
             f"\nAffected principals ({n}):\n{affected}\n"
             f"\nEvidence / how to confirm:\n{evidence}\n"
@@ -5346,8 +5682,9 @@ class HTMLExporter:
         html += '<th>User</th><th>Privileged</th><th>Console PW</th><th>MFA</th><th>Access keys</th><th>Severity</th><th>Issue</th>'
         html += '</tr></thead><tbody>'
         for c in issues:
-            mfa = 'Yes' if c.get('has_mfa') else "<span style='color:var(--cr)'>No</span>"
             pw = 'Yes' if c.get('active_password') else 'No'
+            mfa = ('Yes' if c.get('has_mfa') else "<span style='color:var(--cr)'>No</span>") \
+                if c.get('active_password') else 'N/A'
             priv = '<span class="badge high" style="font-size:8px">Yes</span>' if c.get('privileged') else 'No'
             keys = c.get('num_access_keys', 0)
             keys_html = f"<span style='color:var(--cr)'>{keys}</span>" if keys else "0"
@@ -5364,14 +5701,16 @@ class HTMLExporter:
         html = '<div class="affected-principals"><div class="affected-principals-header">'
         html += f'<span style="font-size:10px;color:var(--tx2)">{len(trusts)} trust(s)</span></div>'
         html += '<div class="table-wrapper"><table class="trust-table"><thead><tr>'
-        html += '<th>Role</th><th>Kind</th><th>Trusted principal</th><th>Target admin</th><th>Risk</th><th>Why</th>'
+        html += '<th>Role</th><th>Kind</th><th>Trusted principal</th><th>Admin</th><th>Privileged</th><th>Risk</th><th>Why</th>'
         html += '</tr></thead><tbody>'
         for t in trusts:
             tgt = '<span class="badge critical" style="font-size:8px">Yes</span>' if t.get('target_is_admin') else 'No'
+            privileged = '<span class="badge high" style="font-size:8px">Yes</span>' if t.get('target_is_privileged') else 'No'
             html += (f"<tr><td><code>{cls._escape(t.get('role_name',''))}</code></td>"
                      f"<td>{cls._escape(t.get('principal_kind','AWS'))}</td>"
                      f"<td><code style='font-size:10px'>{cls._escape(str(t.get('trusted_principal',''))[:60])}</code></td>"
                      f"<td>{tgt}</td>"
+                     f"<td>{privileged}</td>"
                      f"<td><span class='badge {t.get('risk_level','medium')}'>{t.get('risk_level','')}</span></td>"
                      f"<td style='font-size:11px'>{cls._escape(t.get('reason',''))}</td></tr>")
         html += '</tbody></table></div></div>'
@@ -5399,28 +5738,70 @@ class HTMLExporter:
         html += '</div></div>'
 
         if is_overperm:
-            html += '<div class="overperm-grid">'
             for i, pd in enumerate(principals_detail):
                 name = pd.get("name", pd.get("arn", "").split("/")[-1])
                 arn = pd.get("arn", "")
                 ptype = "role" if ":role/" in arn else "user"
                 groups = pd.get("capability_groups", [])
-                top_group = groups[0].get("group", "Permissions") if groups else "Permissions"
-
                 hidden_class = "principals-hidden" if i >= show_limit else ""
-                html += f'''<div class="overperm-chip {hidden_class}" data-principal-idx="{fid}"
-                    onclick="copyArn(this.querySelector('.copy-arn-btn'),'{cls._escape_js(arn)}')" title="{cls._escape(arn)}">
-                    <div class="overperm-chip-icon">{'R' if ptype == 'role' else 'U'}</div>
-                    <div class="overperm-chip-info">
-                        <div class="overperm-chip-name">{cls._escape(name)}</div>
-                        <div class="overperm-chip-type">{cls._escape(top_group)}</div>
+                badges = "".join(
+                    f'<span class="badge {g.get("severity", "medium")}" style="font-size:8px;padding:2px 6px">'
+                    f'{cls._escape(g.get("group", "Permissions"))} ({len(g.get("actions", []))})</span>'
+                    for g in groups[:4]
+                )
+                evidence_html = ""
+                for ev in pd.get("evidence", []):
+                    source = {"group": "inherited from group", "inline": "inline policy", "admin": "AdministratorAccess"}.get(
+                        ev.get("source", "attached"), "attached policy")
+                    resources = ", ".join(ev.get("resources") or ["*"])
+                    conditions = ev.get("conditions") or {}
+                    condition_html = ""
+                    if conditions:
+                        condition_html = (f'<div style="font-size:9px;color:var(--hi);margin-top:3px">'
+                                          f'Condition: <code>{cls._escape(json.dumps(conditions, sort_keys=True))}</code></div>')
+                    evidence_html += f'''
+                        <div style="padding:8px 0;border-bottom:1px solid var(--bd)">
+                            <div style="font-size:11px"><code style="color:var(--cr)">{cls._escape(ev.get("action", ""))}</code>
+                            &larr; {cls._escape(ev.get("policy_name", "unnamed policy"))}
+                            <span style="color:var(--tx2)">({cls._escape(source)}{'; Sid ' + cls._escape(ev.get('sid', '')) if ev.get('sid') else ''})</span></div>
+                            <div style="font-size:10px;margin-top:3px"><strong>Resource:</strong> <code>{cls._escape(resources)}</code></div>
+                            {condition_html}
+                            <div style="font-size:10px;color:var(--tx2);margin-top:4px">{cls._escape(ev.get("explanation", ""))}</div>
+                        </div>'''
+                omitted = pd.get("evidence_omitted_count", 0)
+                if omitted:
+                    evidence_html += f'<div style="font-size:10px;color:var(--hi);margin-top:6px">+{omitted} additional tracked actions; inspect the JSON export and attached policies.</div>'
+                commands = "\n".join(pd.get("validation_commands", []))
+                command_html = (f'<details style="margin-top:8px"><summary style="font-size:10px;cursor:pointer">Read-only validation commands</summary>'
+                                f'<pre style="font-size:9px;white-space:pre-wrap;margin-top:6px">{cls._escape(commands)}</pre></details>') if commands else ""
+                caveats = []
+                if pd.get("permissions_boundary"):
+                    caveats.append("permissions boundary body unresolved; result may be overstated" if pd.get("boundary_capped")
+                                   else "permissions boundary included in the static action inventory")
+                if pd.get("has_notaction"):
+                    caveats.append("NotAction is present; review the full statement")
+                if pd.get("unresolved_managed"):
+                    caveats.append(f'{len(pd["unresolved_managed"])} managed-policy body/bodies unresolved; result may be understated')
+                caveat_html = f'<div style="font-size:9px;color:var(--hi);margin-top:6px">&#9888; {cls._escape("; ".join(caveats))}</div>' if caveats else ""
+                html += f'''<div class="principal-card {hidden_class}" data-principal-idx="{fid}">
+                    <div class="principal-card-left" style="align-items:flex-start">
+                        <div class="principal-card-icon {ptype}">{'R' if ptype == 'role' else 'U'}</div>
+                        <div class="principal-card-info" style="min-width:0">
+                            <div class="principal-card-name">{cls._escape(name)}</div>
+                            <div class="principal-card-arn">{cls._escape(arn)}</div>
+                            <div style="display:flex;flex-wrap:wrap;gap:4px;margin-top:6px">{badges}</div>
+                            <details style="margin-top:8px" {'open' if i < 3 else ''}>
+                                <summary style="font-size:10px;cursor:pointer">Why flagged: {pd.get('dangerous_action_count', len(pd.get('dangerous_actions', [])))} tracked high-impact action(s)</summary>
+                                <div style="border-left:2px solid var(--bd);padding-left:9px;margin-top:6px">{evidence_html}</div>
+                            </details>
+                            {caveat_html}{command_html}
+                        </div>
                     </div>
-                    <button class="copy-arn-btn" onclick="event.stopPropagation();copyArn(this,'{cls._escape_js(arn)}')" style="display:none">Copy</button>
+                    <div class="principal-card-actions"><button class="copy-arn-btn" onclick="event.stopPropagation();copyArn(this,'{cls._escape_js(arn)}')">Copy ARN</button></div>
                 </div>'''
-            html += '</div>'
 
             if len(principals_detail) > show_limit:
-                html += f'''<button class="show-more-btn" onclick="togglePrincipalsChips(this, '{fid}')" data-showing="false">
+                html += f'''<button class="show-more-btn" onclick="togglePrincipals(this, '{fid}')" data-showing="false">
                     Show {len(principals_detail) - show_limit} more principals
                 </button>'''
         else:
@@ -5460,8 +5841,9 @@ class HTMLExporter:
                 if evidence_html:
                     evidence_html = f'<div style="margin-top:6px;border-left:2px solid var(--bd);padding-left:8px">{evidence_html}</div>'
                 caveats = []
-                if pd.get("boundary_capped"):
-                    caveats.append("has a permissions boundary (effective access may be capped)")
+                if pd.get("permissions_boundary"):
+                    caveats.append("permissions boundary evaluated" if not pd.get("boundary_capped")
+                                   else "permissions boundary body unresolved; access may be overstated")
                 if pd.get("has_notaction"):
                     caveats.append("uses NotAction (review full grant manually)")
                 if pd.get("unresolved_managed"):
@@ -5617,7 +5999,7 @@ class HTMLExporter:
         users = [r for r in results if r.get("type") == "user"]
         roles = [r for r in results if r.get("type") == "role"]
         all_arns = [r.get("principal", r.get("arn", "")) for r in results]
-        arns_json = json.dumps(all_arns).replace("'", "\\'")
+        arns_json = cls._json_for_script(all_arns).replace("'", "\\'")
 
         query_explanations = {
             "Administrative Principals": {
@@ -5627,8 +6009,8 @@ class HTMLExporter:
             },
             "Privilege Escalation": {
                 "what": "Non-admin principals who can escalate to admin through one or more steps",
-                "why": "These are 'shadow admins' - they appear limited but can reach full access. Often overlooked in security reviews.",
-                "check": "Each of these principals is effectively an admin and should be treated as such."
+                "why": "The graph contains a path to full access that can be overlooked in attachment-only IAM reviews.",
+                "check": "Treat each as potentially admin-capable; validate conditions, SCPs/RCPs, session policies, and the current target trust before reporting."
             },
             "Secrets Access": {
                 "what": "Principals who can read secrets from Secrets Manager or SSM Parameter Store",
@@ -5728,17 +6110,24 @@ class HTMLExporter:
         technique_explanations = {
             "Direct STS AssumeRole": {
                 "what": "The attacker can directly assume a privileged IAM role using their current credentials.",
-                "why": "Trust policies allow the source principal to call sts:AssumeRole on the target role. This grants immediate access to the role's permissions without any additional steps.",
-                "impact": "Instant privilege escalation to the target role's full permission set.",
-                "verify_cli": "aws sts assume-role --role-arn <TARGET_ROLE_ARN> --role-session-name test-escalation",
+                "why": "A usable path requires both a compatible target trust policy and authorization for the caller's sts:AssumeRole request. The per-hop evidence below shows what was actually found.",
+                "impact": "A successful call returns a target-role session, subject to boundaries, session policies, SCPs and request conditions.",
+                "verify_cli": "aws iam simulate-principal-policy --policy-source-arn <SOURCE_PRINCIPAL_ARN> --action-names sts:AssumeRole --resource-arns <TARGET_ROLE_ARN>\naws iam get-role --role-name <TARGET_ROLE_NAME>",
                 "exploit_cli": "# After assuming the role, use the temporary credentials:\nexport AWS_ACCESS_KEY_ID=<AccessKeyId>\nexport AWS_SECRET_ACCESS_KEY=<SecretAccessKey>\nexport AWS_SESSION_TOKEN=<SessionToken>\naws sts get-caller-identity  # Verify you're now the target role"
             },
             "Lambda Function Abuse": {
                 "what": "The attacker can create or modify Lambda functions that execute with a privileged role.",
                 "why": "Having lambda:CreateFunction/UpdateFunctionCode with iam:PassRole allows creating functions that run with elevated privileges. The Lambda service assumes the execution role.",
                 "impact": "Code execution in the context of privileged roles, enabling arbitrary AWS API calls.",
-                "verify_cli": "aws lambda list-functions --query 'Functions[*].[FunctionName,Role]'\naws iam simulate-principal-policy --policy-source-arn <YOUR_ARN> --action-names lambda:CreateFunction iam:PassRole",
+                "verify_cli": "aws lambda list-functions --query 'Functions[*].[FunctionName,Role]'\naws iam simulate-principal-policy --policy-source-arn <SOURCE_PRINCIPAL_ARN> --action-names iam:PassRole --resource-arns <TARGET_ROLE_ARN>\naws iam simulate-principal-policy --policy-source-arn <SOURCE_PRINCIPAL_ARN> --action-names lambda:CreateFunction --resource-arns '*'",
                 "exploit_cli": "# Create a malicious Lambda that exfiltrates role credentials:\naws lambda create-function --function-name exploit-func \\\n  --runtime python3.9 --role <PRIVILEGED_ROLE_ARN> \\\n  --handler index.handler --zip-file fileb://exploit.zip\naws lambda invoke --function-name exploit-func output.txt"
+            },
+            "Lambda CreateFunction": {
+                "what": "The source may be able to configure Lambda to run code with the target execution role.",
+                "why": "A usable route requires resource-scoped iam:PassRole, function-creation permission, Lambda-compatible role trust, and a way to cause the function to execute. Review each prerequisite below.",
+                "impact": "Successfully executed function code receives the target role's session credentials and effective permissions.",
+                "verify_cli": "aws iam simulate-principal-policy --policy-source-arn <SOURCE_ARN> --action-names lambda:CreateFunction iam:PassRole --resource-arns <TARGET_ROLE_ARN>\naws iam get-role --role-name <TARGET_ROLE_NAME>",
+                "exploit_cli": "# In an explicitly authorized test account, validate with a benign function that calls only sts:GetCallerIdentity."
             },
             "EC2 Instance Profile": {
                 "what": "The attacker can launch EC2 instances with privileged instance profiles attached.",
@@ -5856,20 +6245,77 @@ class HTMLExporter:
             if len(tech_paths) > 10:
                 html += f'<p style="color:var(--tx2);font-size:11px;margin-top:8px">+{len(tech_paths) - 10} more paths</p>'
 
+            html += '<h4 style="margin-top:16px">Why these paths exist</h4>'
+            for path_index, path in enumerate(tech_paths[:10], 1):
+                html += f'''
+                <details style="margin:8px 0;border:1px solid var(--bd);border-radius:6px;padding:9px 11px">
+                    <summary style="cursor:pointer;color:var(--tx);font-size:12px;font-weight:600">
+                        Path {path_index}: <code>{cls._escape(path.source.name)}</code> &rarr; <code>{cls._escape(path.target.name)}</code>
+                    </summary>
+                    <p style="font-size:11px;color:{'var(--olive)' if not path.missing_prerequisites else 'var(--cr)'};margin:9px 0 4px">
+                        <strong>Evidence status:</strong> {cls._escape(path.evidence_status.replace('-', ' '))}. Live validation is still required.
+                    </p>
+                    <p style="font-size:12px;line-height:1.6;color:var(--tx2);margin:10px 0">{cls._escape(path.attack_narrative)}</p>
+                '''
+                if path.missing_prerequisites:
+                    html += '<div style="font-size:12px;color:var(--tx);font-weight:600">Missing local prerequisites</div><ul style="font-size:11px;line-height:1.6;color:var(--cr);margin:4px 0 8px 18px">'
+                    for prerequisite in path.missing_prerequisites:
+                        html += f'<li>{cls._escape(prerequisite)}</li>'
+                    html += '</ul>'
+                for hop in path.hop_explanations:
+                    html += f'''
+                    <div style="border-left:3px solid var(--hi);padding:7px 10px;margin:9px 0;background:var(--bg2)">
+                        <div style="font-size:12px;font-weight:600;color:var(--tx)">Step {hop["step"]}: {cls._escape(hop["mechanism"])}</div>
+                        <div style="font-size:11px;color:var(--tx2);margin-top:4px"><code>{cls._escape(hop["source"])}</code> &rarr; <code>{cls._escape(hop["target"])}</code></div>
+                        <p style="font-size:12px;line-height:1.55;color:var(--tx2);margin:7px 0"><strong style="color:var(--tx)">Why:</strong> {cls._escape(hop["why"])}</p>
+                        <p style="font-size:12px;line-height:1.55;color:var(--tx2);margin:7px 0"><strong style="color:var(--tx)">Graph proof:</strong> {cls._escape(hop["graph_evidence"].get("reason", ""))}</p>
+                    '''
+                    policy_evidence = hop.get("identity_policy_evidence", [])
+                    if policy_evidence:
+                        html += '<div style="font-size:12px;color:var(--tx);font-weight:600">Identity-policy evidence</div><ul style="font-size:11px;line-height:1.6;color:var(--tx2);margin:4px 0 6px 18px">'
+                        for evidence in policy_evidence:
+                            conditions = evidence.get("conditions") or {}
+                            condition_text = json.dumps(conditions, sort_keys=True) if conditions else "none"
+                            scope_label = "not-resources" if evidence.get("not_resources") else "resources"
+                            scope_value = evidence.get("not_resources") or evidence.get("resources", [])
+                            html += (f'<li><code>{cls._escape(evidence["action"])}</code> from '
+                                     f'<code>{cls._escape(evidence["policy_name"])}</code> '
+                                     f'({cls._escape(evidence["attachment_source"])}); {scope_label} '
+                                     f'<code>{cls._escape(json.dumps(scope_value))}</code>; '
+                                     f'conditions <code>{cls._escape(condition_text)}</code></li>')
+                        html += '</ul>'
+                    else:
+                        html += '<p style="font-size:11px;color:var(--cr);margin:5px 0">No matching identity-policy statement was retained; validate this edge against the live policies.</p>'
+                    trust_evidence = hop.get("target_trust_evidence", [])
+                    if trust_evidence:
+                        html += '<div style="font-size:12px;color:var(--tx);font-weight:600">Target trust evidence</div><ul style="font-size:11px;line-height:1.6;color:var(--tx2);margin:4px 0 6px 18px">'
+                        for trust in trust_evidence:
+                            html += (f'<li>Principal <code>{cls._escape(json.dumps(trust.get("principal", {}), sort_keys=True))}</code>; '
+                                     f'actions <code>{cls._escape(json.dumps(trust.get("actions", [])))}</code>; '
+                                     f'conditions <code>{cls._escape(json.dumps(trust.get("conditions", {}), sort_keys=True))}</code></li>')
+                        html += '</ul>'
+                    else:
+                        html += '<p style="font-size:11px;color:var(--olive);margin:5px 0">No matching target-trust statement was extracted; inspect the live role trust policy.</p>'
+                    html += f'''
+                        <p style="font-size:12px;line-height:1.55;color:var(--tx2);margin:7px 0"><strong style="color:var(--tx)">Access gained:</strong> {cls._escape(hop["access_gained"])}</p>
+                    </div>
+                    '''
+                html += f'''
+                    <div style="font-size:12px;line-height:1.6;color:var(--tx2);margin-top:9px"><strong style="color:var(--tx)">Result if successful:</strong> {cls._escape(path.resulting_access)}</div>
+                    <div style="font-size:12px;color:var(--tx);font-weight:600;margin-top:9px">Validate before reporting as exploitable</div>
+                    <ul style="font-size:11px;line-height:1.6;color:var(--tx2);margin:4px 0 2px 18px">
+                '''
+                for note in path.validation_notes:
+                    html += f'<li>{cls._escape(note)}</li>'
+                html += '</ul></details>'
+
             verify_cli = tech_info.get("verify_cli", "")
-            exploit_cli = tech_info.get("exploit_cli", "")
-            combined_cli = ""
-            if verify_cli:
-                combined_cli += verify_cli
-            if exploit_cli:
-                if combined_cli:
-                    combined_cli += "\n\n"
-                combined_cli += exploit_cli
+            combined_cli = verify_cli
 
             if combined_cli:
                 html += f'''
                 <details style="margin-top:12px">
-                    <summary style="cursor:pointer;color:var(--hi);font-size:12px;font-weight:500">Commands</summary>
+                    <summary style="cursor:pointer;color:var(--hi);font-size:12px;font-weight:500">Read-only validation commands</summary>
                     <div class="cli-block" style="margin-top:8px">
                         <div class="cli-block-header">
                             <button class="copy-btn" onclick="copyText(this)">Copy</button>
@@ -5993,11 +6439,11 @@ class HTMLExporter:
                         if action in DANGEROUS_ACTIONS or action == "*" or action.endswith(":*"):
                             dangerous_in_policy.append(action)
 
-                policy_json_str = json.dumps(policy_doc)
-                issues_json = json.dumps(dangerous_in_policy)
+                policy_json_str = cls._json_for_script(policy_doc)
+                issues_json = cls._json_for_script(dangerous_in_policy)
 
                 scripts.append(
-                    f"registerPolicy({json.dumps(policy_arn)}, {policy_json_str}, {issues_json});"
+                    f"registerPolicy({cls._json_for_script(policy_arn)}, {policy_json_str}, {issues_json});"
                 )
 
         if not scripts:
@@ -6103,6 +6549,8 @@ class HTMLExporter:
             "Identity policies: attached (customer + resolved AWS-managed), inline, and group-inherited",
             "Explicit Deny (broad, unconditional) is subtracted from Allow; NotAction is expanded",
             "Permissions boundaries: intersected when the body is available, otherwise the principal is flagged as boundary-capped",
+            "Ad-hoc queries evaluate Action/NotAction and Resource/NotResource wildcards against the requested resource",
+            "Escalation evidence uses PMapper authentication edges and preserves distinct paths up to five hops",
             "Trust policies: AWS, Federated (SAML/OIDC incl. GitHub Actions), and Service principals; ExternalId enforcement is verified, not just presence",
             "Credential hygiene: MFA, console password, and long-term access keys",
         ]
@@ -6110,9 +6558,9 @@ class HTMLExporter:
             "Service Control Policies (SCPs) and Resource Control Policies (RCPs) - org guardrails are NOT modeled; a finding may be capped by an SCP",
             "Resource-based policies (S3 bucket / KMS key / SNS policies) and session policies",
             "Runtime condition evaluation (source IP, aws:PrincipalTag, time) - conditions are noted, not simulated",
-            "Resource-level scoping for every action in 'who can do X' (IAM escalation actions ARE resource-checked; others are action-level)",
             "AWS-managed policy bodies not in the built-in catalog (flagged per-principal as 'unresolved' so capabilities are not silently understated)",
             "Access-key AGE and last-used, and unused permissions (collect from an IAM credential report / Access Analyzer to complete the assessment)",
+            "Escalation chains longer than five hops (the enumeration limit used to keep cyclic graphs tractable)",
         ]
         does_html = "".join(f"<li>{cls._escape(x)}</li>" for x in does)
         does_not_html = "".join(f"<li>{cls._escape(x)}</li>" for x in does_not)
@@ -6286,13 +6734,17 @@ class JSONExporter:
     """Export analysis results to JSON."""
 
     @staticmethod
-    def export(analyses: List[AccountAnalysis], output_path: Path):
+    def export(analyses: List[AccountAnalysis], output_path: Path,
+               cross_account_findings: List[Finding] = None):
         """Export all analyses to a single JSON file."""
         output = {
             "generated_at": datetime.now().isoformat(),
             "tool": "privmapper_advanced",
-            "version": "1.0.0",
+            "version": "2.0.0",
             "accounts": [],
+            "cross_account_findings": [
+                asdict(finding) for finding in (cross_account_findings or [])
+            ],
         }
 
         for analysis in analyses:
@@ -6324,6 +6776,11 @@ class JSONExporter:
                         "blast_radius": p.blast_radius,
                         "mitre_techniques": p.mitre_techniques,
                         "attack_narrative": p.attack_narrative,
+                        "hop_explanations": p.hop_explanations,
+                        "resulting_access": p.resulting_access,
+                        "validation_notes": p.validation_notes,
+                        "evidence_status": p.evidence_status,
+                        "missing_prerequisites": p.missing_prerequisites,
                         "hops": [{"source": h.source, "target": h.target,
                                  "reason": h.reason} for h in p.hops],
                     }
@@ -6347,8 +6804,9 @@ class CSVExporter:
               "principal", "risk_score", "evidence", "impact", "remediation"]
 
     @staticmethod
-    def export(analyses: List[AccountAnalysis], output_path: Path):
-        """Export findings to CSV with assessment substance (CVSS, risk score, evidence)."""
+    def export(analyses: List[AccountAnalysis], output_path: Path,
+               cross_account_findings: List[Finding] = None):
+        """Export findings to CSV with assessment substance and evidence."""
         rows = []
 
         for analysis in analyses:
@@ -6388,12 +6846,35 @@ class CSVExporter:
                     "title": f"Escalation: {path.source.name} -> {path.target.name} ({path.technique})",
                     "severity": path.severity,
                     "category": "privesc",
-                    "cvss": CVSS_VECTORS.get("privesc", ""),
+                    "cvss": "",
                     "principal": path.source.arn,
                     "risk_score": path.risk_score,
-                    "evidence": chain,
-                    "impact": f"Can escalate to {path.target.name} via {path.technique}",
+                    "evidence": json.dumps({
+                        "chain": chain,
+                        "hops": path.hop_explanations,
+                        "evidence_status": path.evidence_status,
+                        "missing_prerequisites": path.missing_prerequisites,
+                        "validation_notes": path.validation_notes,
+                    }, separators=(",", ":")),
+                    "impact": path.resulting_access,
                     "remediation": RemediationEngine.get_path_remediation(path)["fix"],
+                })
+
+        for finding in cross_account_findings or []:
+            affected = finding.principals or ["multiple accounts"]
+            for principal in affected:
+                rows.append({
+                    "account_id": "multi-account",
+                    "finding_id": finding.id,
+                    "title": finding.title,
+                    "severity": finding.severity,
+                    "category": finding.category,
+                    "cvss": "",
+                    "principal": principal,
+                    "risk_score": "",
+                    "evidence": finding.description,
+                    "impact": finding.impact,
+                    "remediation": finding.remediation,
                 })
 
         if rows:
@@ -6409,15 +6890,18 @@ class CSVExporter:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Advanced AWS IAM Security Analysis Tool - Full PMapper Replacement",
+        description=("Evidence-backed AWS IAM graph analysis and reporting. "
+                     "Analyze existing PMapper data or collect multiple AWS profiles concurrently."),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
   # Run pmapper with auto-detected regions (recommended)
   %(prog)s --profile my-aws-profile --create-graph
   %(prog)s --profile profile1 --profile profile2 --create-graph
+  %(prog)s --profiles profile1 profile2 profile3 --workers 3
+  %(prog)s --profile-file ./aws-profiles.txt --create-graph
 
-  # Run pmapper with manual exclude-regions (old behavior)
+  # Run pmapper with explicitly excluded regions
   %(prog)s --profile my-aws-profile
 
   # Read existing pmapper graph data
@@ -6429,6 +6913,9 @@ Examples:
 
   # Auto-detect existing pmapper data
   %(prog)s --auto-detect
+
+  # No arguments: print this help menu and perform no scan
+  %(prog)s
 
   # PMapper-style queries (requires --input or --profile)
   %(prog)s -i ./graph --query "who can do iam:CreateUser"
@@ -6449,7 +6936,22 @@ Examples:
         action="append",
         dest="profiles",
         metavar="PROFILE",
-        help="AWS profile to analyze (runs pmapper). Can specify multiple.",
+        help="AWS profile to collect; repeat or use comma-separated names.",
+    )
+    parser.add_argument(
+        "--profiles",
+        action="append",
+        nargs="+",
+        dest="profile_groups",
+        metavar="PROFILE",
+        help="One or more AWS profiles to collect concurrently.",
+    )
+    parser.add_argument(
+        "--profile-file",
+        action="append",
+        dest="profile_files",
+        metavar="PATH",
+        help="Text file containing newline- or comma-separated AWS profile names; repeatable.",
     )
 
     parser.add_argument(
@@ -6468,7 +6970,7 @@ Examples:
     parser.add_argument(
         "--format", "-f",
         default="html",
-        help="Output formats: html,json,csv (comma-separated, default: html)",
+        help="Output formats: html,json,csv (comma-separated) or all (default: html)",
     )
     parser.add_argument(
         "--auto-detect", "-a",
@@ -6484,6 +6986,12 @@ Examples:
         "--create-graph",
         action="store_true",
         help="Auto-detect enabled regions and run pmapper graph create (recommended)",
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=4,
+        help="Maximum profiles to collect concurrently (default: 4)",
     )
 
     parser.add_argument(
@@ -6508,7 +7016,45 @@ Examples:
         help="Don't start HTTP server after generating report",
     )
 
+    if len(sys.argv) == 1:
+        parser.print_help()
+        return 0
+
     args = parser.parse_args()
+
+    profile_values = list(args.profiles or [])
+    for group in args.profile_groups or []:
+        profile_values.extend(group)
+    for profile_file in args.profile_files or []:
+        path = Path(profile_file).expanduser()
+        try:
+            content = path.read_text()
+        except OSError as ex:
+            parser.error(f"cannot read --profile-file {profile_file}: {ex}")
+        for line in content.splitlines():
+            line = line.split("#", 1)[0].strip()
+            if line:
+                profile_values.extend(line.split(","))
+    profiles = []
+    for value in profile_values:
+        profiles.extend(name.strip() for name in value.split(",") if name.strip())
+    args.profiles = list(dict.fromkeys(profiles)) or None
+
+    valid_formats = {"html", "json", "csv"}
+    if args.format.strip().lower() == "all":
+        args.format = "html,json,csv"
+    requested_formats = {f.strip().lower() for f in args.format.split(",") if f.strip()}
+    invalid_formats = requested_formats - valid_formats
+    if not requested_formats or invalid_formats:
+        parser.error("--format must be all or contain only: html,json,csv")
+    if args.workers < 1:
+        parser.error("--workers must be at least 1")
+    if not 1 <= args.port <= 65535:
+        parser.error("--port must be between 1 and 65535")
+    if (args.profile_groups or args.profile_files) and not args.profiles:
+        parser.error("profile list input did not contain any profile names")
+    if args.profiles and (args.inputs or args.auto_detect):
+        parser.error("profile inputs cannot be combined with --input or --auto-detect")
 
     output_dir = Path(args.output)
     analyses = []
@@ -6525,27 +7071,47 @@ Examples:
 
     if args.profiles:
         print(f"\n{'='*60}")
-        print(f"  PrivMapper Advanced - IAM Security Analysis")
-        print(f"  Mode: Run PMapper")
+        print("  PrivMapper Advanced - IAM Security Analysis")
+        print("  Mode: Run PMapper")
         print(f"  Profiles: {', '.join(args.profiles)}")
         if args.create_graph:
-            print(f"  Region Detection: Auto (enabled regions only)")
+            print("  Region Detection: Auto (enabled regions only)")
         print(f"{'='*60}\n")
 
         output_dir.mkdir(parents=True, exist_ok=True)
+
+        workers = max(1, min(args.workers, len(args.profiles)))
+        log(f"Collecting {len(args.profiles)} profile(s) with {workers} concurrent worker(s)")
+        profile_runs = {}
+        runners = {}
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="privmapper") as executor:
+            future_to_profile = {}
+            for profile in args.profiles:
+                runner = PMapperRunner(
+                    profile,
+                    output_dir,
+                    exclude_regions=args.exclude_regions,
+                    auto_detect_regions=args.create_graph,
+                )
+                runners[profile] = runner
+                future_to_profile[executor.submit(runner.run_full_analysis)] = profile
+
+            for future in as_completed(future_to_profile):
+                profile = future_to_profile[future]
+                try:
+                    profile_runs[profile] = future.result()
+                except Exception as ex:
+                    err(f"Profile {profile} failed: {ex}")
 
         for profile in args.profiles:
             log(f"{'═'*50}")
             log(f"Profile: {profile}")
             log(f"{'═'*50}")
 
-            runner = PMapperRunner(
-                profile,
-                output_dir,
-                exclude_regions=args.exclude_regions,
-                auto_detect_regions=args.create_graph
-            )
-            stats, results, svg_path = runner.run_full_analysis()
+            runner = runners[profile]
+            if profile not in profile_runs:
+                continue
+            stats, results, svg_path = profile_runs[profile]
 
             if runner.regions_used:
                 all_regions_used.extend(runner.regions_used)
@@ -6555,6 +7121,29 @@ Examples:
 
             if not stats:
                 err(f"Failed to analyze {profile}")
+                continue
+
+            graph_path = runner.find_graph_path(stats.get("account_id", ""))
+            if graph_path:
+                loader = GraphLoader(graph_path)
+                try:
+                    principals, edges, policies = loader.load()
+                except ValueError as ex:
+                    err(f"Profile {profile} produced an invalid graph: {ex}")
+                    continue
+                analysis = AnalysisEngine(
+                    principals, edges, policies, stats.get("account_id", "")
+                ).analyze()
+                analysis.account_alias = profile
+                analyses.append(analysis)
+                profile_results[profile] = {
+                    "stats": stats,
+                    "results": results,
+                    "svg_path": svg_path,
+                    "graph_path": graph_path,
+                }
+                ok(f"Profile {profile} complete - {len(analysis.findings)} findings, "
+                   f"{len(analysis.escalation_paths)} paths")
                 continue
 
             profile_results[profile] = {
@@ -6715,8 +7304,8 @@ Examples:
         input_paths = list(dict.fromkeys(input_paths))
 
         print(f"\n{'='*60}")
-        print(f"  PrivMapper Advanced - IAM Security Analysis")
-        print(f"  Mode: Read Existing Graph Data")
+        print("  PrivMapper Advanced - IAM Security Analysis")
+        print("  Mode: Read Existing Graph Data")
         print(f"  Analyzing {len(input_paths)} graph(s)")
         print(f"{'='*60}\n")
 
@@ -6728,7 +7317,11 @@ Examples:
                 print(f"[!] Invalid graph directory: {graph_path}")
                 continue
 
-            principals, edges, policies = loader.load()
+            try:
+                principals, edges, policies = loader.load()
+            except ValueError as ex:
+                print(f"[!] Could not load graph {graph_path}: {ex}")
+                continue
             print(f"    Loaded {len(principals)} principals, {len(edges)} edges, {len(policies)} policies")
 
             engine = AnalysisEngine(principals, edges, policies)
@@ -6762,7 +7355,7 @@ Examples:
 
     cross_findings = []
     if len(analyses) > 1:
-        print(f"\n[*] Running cross-account analysis...")
+        print("\n[*] Running cross-account analysis...")
         cross_analyzer = CrossAccountAnalyzer(analyses)
         cross_findings = cross_analyzer.analyze()
         print(f"    Found {len(cross_findings)} cross-account findings")
@@ -6783,13 +7376,13 @@ Examples:
         HTMLExporter.export(analyses, cross_findings, output_dir / "report.html", run_metadata)
 
     if "json" in formats:
-        JSONExporter.export(analyses, output_dir / "findings.json")
+        JSONExporter.export(analyses, output_dir / "findings.json", cross_findings)
 
     if "csv" in formats:
-        CSVExporter.export(analyses, output_dir / "findings.csv")
+        CSVExporter.export(analyses, output_dir / "findings.csv", cross_findings)
 
     print(f"\n{'='*60}")
-    print(f"  Analysis Complete")
+    print("  Analysis Complete")
     print(f"  Output: {output_dir}/")
     print(f"{'='*60}\n")
 
@@ -6802,10 +7395,9 @@ Examples:
         print(f"  [!] {total_paths} privilege escalation paths detected")
 
     if "html" in formats and not args.no_server:
-        report_path = output_dir / "report.html"
         print(f"\n  Starting local server on port {args.port}...")
         print(f"  Open in browser: http://localhost:{args.port}/report.html")
-        print(f"  Press Ctrl+C to stop the server\n")
+        print("  Press Ctrl+C to stop the server\n")
 
         import http.server
         import socketserver
@@ -6827,8 +7419,12 @@ Examples:
             else:
                 print(f"  [!] Could not start server: {e}")
             print(f"\n  Open report manually: open {output_dir}/report.html\n")
-    else:
+    elif "html" in formats:
         print(f"\n  Open report: open {output_dir}/report.html\n")
+    else:
+        generated = [str(output_dir / ("findings.json" if f == "json" else "findings.csv"))
+                     for f in formats if f in ("json", "csv")]
+        print(f"\n  Generated: {', '.join(generated)}\n")
 
 
 if __name__ == "__main__":

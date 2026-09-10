@@ -7,7 +7,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import List
 
-from ..models import AccountAnalysis
+from ..models import AccountAnalysis, Finding
 from ..knowledge import AWS_MANAGED_PATTERNS
 
 
@@ -15,13 +15,17 @@ class JSONExporter:
     """Export analysis results to JSON."""
 
     @staticmethod
-    def export(analyses: List[AccountAnalysis], output_path: Path):
+    def export(analyses: List[AccountAnalysis], output_path: Path,
+               cross_account_findings: List[Finding] = None):
         """Export all analyses to a single JSON file."""
         output = {
             "generated_at": datetime.now().isoformat(),
             "tool": "privmapper_advanced",
-            "version": "1.0.0",
+            "version": "2.0.0",
             "accounts": [],
+            "cross_account_findings": [
+                asdict(finding) for finding in (cross_account_findings or [])
+            ],
         }
 
         for analysis in analyses:
@@ -53,6 +57,11 @@ class JSONExporter:
                         "blast_radius": p.blast_radius,
                         "mitre_techniques": p.mitre_techniques,
                         "attack_narrative": p.attack_narrative,
+                        "hop_explanations": p.hop_explanations,
+                        "resulting_access": p.resulting_access,
+                        "validation_notes": p.validation_notes,
+                        "evidence_status": p.evidence_status,
+                        "missing_prerequisites": p.missing_prerequisites,
                         "hops": [{"source": h.source, "target": h.target,
                                  "reason": h.reason} for h in p.hops],
                     }

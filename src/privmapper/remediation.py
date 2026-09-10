@@ -36,8 +36,8 @@ class RemediationEngine:
 }''',
         },
         "cross_account_no_external_id": {
-            "issue": "Cross-account trust without ExternalId is vulnerable to confused deputy attacks",
-            "fix": "Add sts:ExternalId condition to the trust policy",
+            "issue": "External trust requires ownership and purpose validation; ExternalId is specifically relevant to third-party delegation",
+            "fix": "For third parties, require a unique provider-assigned ExternalId. For owned accounts, prefer specific principals and organization-aware controls where appropriate",
             "example": '''{
     "Effect": "Allow",
     "Principal": {"AWS": "arn:aws:iam::TRUSTED_ACCOUNT:root"},
@@ -64,8 +64,8 @@ class RemediationEngine:
 }''',
         },
         "lambda_abuse": {
-            "issue": "Lambda function permissions allow code injection via role assumption",
-            "fix": "Restrict lambda:UpdateFunctionCode and lambda:CreateFunction to specific functions",
+            "issue": "A PMapper edge indicates Lambda can be used to access a more privileged execution role",
+            "fix": "Restrict Lambda mutation/invocation permissions and iam:PassRole; ensure only Lambda-compatible, least-privileged roles can be passed",
             "example": '''{
     "Effect": "Allow",
     "Action": ["lambda:UpdateFunctionCode"],
@@ -93,9 +93,7 @@ class RemediationEngine:
 aws iam generate-service-last-accessed-details --arn <PRINCIPAL_ARN>
 aws accessanalyzer start-policy-generation --policy-generation-details '{"principalArn":"<PRINCIPAL_ARN>"}'
 
-# Use AWS managed job-function policies:
-# - ViewOnlyAccess, PowerUserAccess, SystemAdministrator, DatabaseAdministrator
-# - Create custom policies using Access Analyzer recommendations''',
+# Create customer-managed policies from validated Access Analyzer and CloudTrail evidence.''',
         },
         "permissions_boundary": {
             "issue": "No permissions boundary limits the maximum permissions for delegated principals",
@@ -186,7 +184,7 @@ aws accessanalyzer start-policy-generation --policy-generation-details '{"princi
         """Get specific remediation for a cross-account trust issue."""
         if trust.is_wildcard:
             return cls.REMEDIATIONS["cross_account_wildcard"]
-        elif not trust.has_external_id:
+        elif not trust.has_external_id and trust.principal_kind == "AWS":
             return cls.REMEDIATIONS["cross_account_no_external_id"]
         else:
             return {

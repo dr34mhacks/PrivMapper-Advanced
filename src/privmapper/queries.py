@@ -3,10 +3,12 @@
 import json
 import re
 from collections import defaultdict
+from fnmatch import fnmatchcase
 from typing import Dict, List, Optional, Set
 
-from .models import AccountAnalysis, Principal
-from .knowledge import CHECK_LABEL, DANGEROUS_ACTIONS
+from .models import AccountAnalysis
+from .knowledge import DANGEROUS_ACTIONS
+from .managed_policies import resolve_managed_policy_actions
 
 
 class QueryResultsAnalyzer:
@@ -172,7 +174,7 @@ class QueryEngine:
         "privesc": {
             "name": "Privilege Escalation Paths",
             "description": "Find all principals that can escalate to admin",
-            "filter": lambda p, qe: not p.is_admin and any(e.target in qe.admins for e in qe.edge_from.get(p.arn, [])),
+            "filter": lambda p, qe: p.arn in qe.privesc_sources,
         },
         "admin": {
             "name": "Administrative Principals",
@@ -182,7 +184,7 @@ class QueryEngine:
         "shadow": {
             "name": "Shadow Administrators",
             "description": "Principals that can become admin without being admin",
-            "filter": lambda p, qe: not p.is_admin and any(e.target in qe.admins for e in qe.edge_from.get(p.arn, [])),
+            "filter": lambda p, qe: p.arn in qe.shadow_admin_arns,
         },
         "cross-account": {
             "name": "Cross-Account Access",
@@ -229,6 +231,8 @@ class QueryEngine:
                 self.admins.add(principal.arn)
             for action in principal.dangerous_actions:
                 self.action_to_principals[action].add(principal.arn)
+        self.privesc_sources = {path.source.arn for path in self.analysis.escalation_paths}
+        self.shadow_admin_arns = {principal.arn for principal in self.analysis.shadow_admins}
 
     @staticmethod
     def _has_cross_account_trust(principal) -> bool:
@@ -249,9 +253,15 @@ class QueryEngine:
         """
         results = []
 
-        query_lower = query_str.lower().strip()
+        query_text = query_str.strip()
 
-        match = re.match(r"who can do ([a-z0-9:*]+)(?:\s+with\s+(.+))?", query_lower)
+        # Actions are case-insensitive, but resource ARNs can contain
+        # case-sensitive S3 keys. Preserve the resource exactly as entered.
+        match = re.match(
+            r"who can do ([a-z0-9:*?]+)(?:\s+with\s+(.+))?",
+            query_text,
+            re.IGNORECASE,
+        )
         if match:
             action = match.group(1)
             resource = match.group(2) if match.group(2) else "*"
@@ -265,40 +275,20 @@ class QueryEngine:
     def _query_action(self, action: str, resource: str = "*") -> List[Dict]:
         """Find all principals that can perform an action."""
         results = []
-        action_lower = action.lower()
 
         for principal in self.analysis.principals.values():
-            can_do = False
+            can_do = self._can_directly_do(principal, action, resource)
             matched_via = None
-            actions = principal.dangerous_actions
-
-            if principal.is_admin:
-                can_do = True
-                matched_via = "admin (*)"
-            elif action_lower in [a.lower() for a in actions]:
-                can_do = True
-                matched_via = "direct"
-
-            elif "*" in actions or "iam:*" in actions:
-                can_do = True
-                matched_via = "wildcard (*)"
-
-            else:
-                service = action_lower.split(":")[0] if ":" in action_lower else ""
-                service_wildcard = f"{service}:*"
-                if service_wildcard.lower() in [a.lower() for a in actions]:
-                    can_do = True
-                    matched_via = f"service wildcard ({service_wildcard})"
+            if can_do:
+                matched_via = "admin (*)" if principal.is_admin else "direct"
 
             if not can_do:
-                for edge in self.edge_from.get(principal.arn, []):
-                    target = self.analysis.principals.get(edge.target)
-                    if target:
-                        target_actions = target.dangerous_actions
-                        if action_lower in [a.lower() for a in target_actions] or "*" in target_actions:
-                            can_do = True
-                            matched_via = f"indirect via {edge.target.split('/')[-1]}"
-                            break
+                access_path = self._find_access_path(principal.arn, action, resource)
+                if access_path:
+                    can_do = True
+                    target_name = access_path[-1].target.split("/")[-1]
+                    count = len(access_path)
+                    matched_via = f"indirect via {target_name} ({count} hop{'s' if count != 1 else ''})"
 
             if can_do:
                 results.append({
@@ -311,6 +301,104 @@ class QueryEngine:
                 })
 
         return sorted(results, key=lambda x: (not x["direct"], x["name"]))
+
+    def _find_access_path(self, start_arn: str, action: str, resource: str):
+        """Return the shortest graph path to a principal that can do the action."""
+        queue = [(start_arn, [])]
+        visited = {start_arn}
+        while queue:
+            current, path = queue.pop(0)
+            for edge in self.edge_from.get(current, []):
+                if edge.target in visited:
+                    continue
+                visited.add(edge.target)
+                new_path = path + [edge]
+                target = self.analysis.principals.get(edge.target)
+                if target and self._can_directly_do(target, action, resource):
+                    return new_path
+                queue.append((edge.target, new_path))
+        return []
+
+    @staticmethod
+    def _action_matches(statement, action: str) -> bool:
+        requested = action.lower()
+        if statement.not_actions:
+            return not any(fnmatchcase(requested, pattern.lower())
+                           for pattern in statement.not_actions)
+        return any(fnmatchcase(requested, pattern.lower()) for pattern in statement.actions)
+
+    @staticmethod
+    def _resource_matches(statement, resource: str) -> bool:
+        """Whether a statement covers the requested resource.
+
+        Resource "*" in a query means "any resource", while a concrete ARN is
+        matched using IAM-style * and ? wildcards.
+        """
+        if resource == "*":
+            if statement.not_resources:
+                return not any(pattern == "*" for pattern in statement.not_resources)
+            return bool(statement.resources)
+        if statement.not_resources:
+            return not any(fnmatchcase(resource, pattern) for pattern in statement.not_resources)
+        return any(fnmatchcase(resource, pattern) for pattern in statement.resources)
+
+    def _effective_policies(self, principal):
+        policies = []
+        seen = set()
+        for policy_arn in list(principal.policies) + list(principal.group_policy_arns):
+            if not policy_arn or policy_arn in seen:
+                continue
+            seen.add(policy_arn)
+            policy = self.analysis.policies.get(policy_arn)
+            if policy:
+                policies.append(policy)
+                continue
+            actions = resolve_managed_policy_actions(policy_arn)
+            if actions is not None:
+                from .models import Policy, PolicyStatement
+                policies.append(Policy(
+                    arn=policy_arn,
+                    name=policy_arn.split("/")[-1],
+                    statements=[PolicyStatement("Allow", sorted(actions), ["*"])],
+                    is_aws_managed=True,
+                ))
+        policies.extend(principal.inline_policies)
+        return policies
+
+    def _policy_set_allows(self, policies, action: str, resource: str) -> bool:
+        allowed = False
+        for policy in policies:
+            for statement in policy.statements:
+                if not self._action_matches(statement, action):
+                    continue
+                if not self._resource_matches(statement, resource):
+                    continue
+                effect = statement.effect.lower()
+                if effect == "allow":
+                    allowed = True
+                elif effect == "deny" and not statement.conditions:
+                    if resource == "*" and not (
+                        "*" in statement.resources and not statement.not_resources
+                    ):
+                        # A resource-scoped deny does not mean the principal lacks
+                        # this action everywhere.
+                        continue
+                    return False
+        return allowed
+
+    def _can_directly_do(self, principal, action: str, resource: str) -> bool:
+        policies = self._effective_policies(principal)
+        identity_allowed = self._policy_set_allows(policies, action, resource)
+        if principal.is_admin:
+            identity_allowed = True
+        if not identity_allowed:
+            return False
+
+        if principal.permissions_boundary:
+            boundary = self.analysis.policies.get(principal.permissions_boundary)
+            if boundary and not self._policy_set_allows([boundary], action, resource):
+                return False
+        return True
 
     def run_preset(self, preset_name: str) -> List[Dict]:
         """Run a preset query."""

@@ -1,7 +1,6 @@
 """Static CSS/JS assets embedded into the HTML report."""
 
 CSS = """
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap');
 :root{
   /* Black & Olive Green Theme - Gen Z Edition */
   --bg:#0a0a0a;--bg2:#111111;--bg3:#181818;--bg4:#222222;
@@ -16,7 +15,8 @@ CSS = """
   --purple:#a78bfa;--purple2:#1e1a2e;--purple3:#3b2f5a;
   --sidebar:#0a0a0a;--sidebar-text:#8a8a8a;
   --olive:#84a98c;--olive-dark:#52796f;--olive-light:#cad2c5;--olive-bright:#a4c3ac;
-  --mono:'JetBrains Mono',monospace;--body:'Inter',sans-serif;
+  --mono:'JetBrains Mono',ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,'Liberation Mono',monospace;
+  --body:'Inter',-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;
   --shadow-sm:0 1px 2px rgba(0,0,0,0.3);
   --shadow:0 2px 8px rgba(0,0,0,0.4),0 1px 3px rgba(0,0,0,0.3);
   --shadow-lg:0 8px 24px rgba(0,0,0,0.5),0 4px 8px rgba(0,0,0,0.3);
@@ -116,7 +116,7 @@ h1,h2,h3,h4{color:var(--txb);font-weight:700;letter-spacing:-0.02em}
 .finding-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:20px;margin-bottom:20px}
 .finding-grid:last-child{margin-bottom:0}
 @media(max-width:1200px){.finding-grid{grid-template-columns:1fr}.findings-grid{grid-template-columns:1fr}.query-grid{grid-template-columns:repeat(auto-fill,minmax(250px,1fr))}.overperm-grid{grid-template-columns:repeat(auto-fill,minmax(180px,1fr))}.run-info-grid{grid-template-columns:1fr}}
-@media(max-width:900px){.sidebar{display:none}.main-wrapper{margin-left:0}.header{padding:16px 20px}.main{padding:20px}.summary-grid{grid-template-columns:repeat(2,1fr)}.principal-controls{flex-direction:column;align-items:stretch}.filter-group{justify-content:center}.export-group{justify-content:center}.site-footer{left:0!important}.graph-canvas{height:400px!important}}
+@media(max-width:900px){.sidebar{display:none}.main-wrapper{margin-left:0}.header{padding:16px 20px}.main{padding:20px}.summary-grid{grid-template-columns:repeat(2,1fr)}.principal-controls{flex-direction:column;align-items:stretch}.filter-group{justify-content:center}.export-group{justify-content:center}.graph-canvas{height:400px!important}}
 @media(max-width:600px){.summary-grid{grid-template-columns:1fr}.header-title{font-size:18px}.finding-section h4{font-size:9px}.badge{font-size:8px;padding:3px 8px}.site-footer{flex-direction:column;gap:8px;text-align:center}.escalation-table{font-size:11px}.escalation-table th,.escalation-table td{padding:8px 6px}}
 
 /* Tables - Responsive */
@@ -411,7 +411,7 @@ h1,h2,h3,h4{color:var(--txb);font-weight:700;letter-spacing:-0.02em}
 .run-info-toggle:hover{text-decoration:underline}
 
 /* Site Footer */
-.site-footer{position:fixed;bottom:0;left:240px;right:0;background:rgba(10,10,10,0.95);backdrop-filter:blur(8px);border-top:1px solid var(--bd);padding:12px 24px;display:flex;justify-content:space-between;align-items:center;font-size:11px;z-index:100;color:var(--tx2)}
+.site-footer{background:rgba(10,10,10,0.95);border-top:1px solid var(--bd);padding:12px 24px;display:flex;justify-content:space-between;align-items:center;font-size:11px;color:var(--tx2)}
 .site-footer a{color:var(--olive);text-decoration:none}
 .site-footer a:hover{text-decoration:underline}
 

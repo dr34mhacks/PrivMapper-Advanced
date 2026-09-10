@@ -74,6 +74,11 @@ class EscalationPath:
     blast_radius: int = 5
     mitre_techniques: List[Dict] = field(default_factory=list)
     attack_narrative: str = ""
+    hop_explanations: List[Dict[str, Any]] = field(default_factory=list)
+    resulting_access: str = ""
+    validation_notes: List[str] = field(default_factory=list)
+    evidence_status: str = "validation-required"
+    missing_prerequisites: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -89,6 +94,7 @@ class CrossAccountTrust:
     principal_kind: str = "AWS"
     external_id_enforced: bool = False
     target_is_admin: bool = False
+    target_is_privileged: bool = False
     reason: str = ""
     remediation_key: str = ""
 
@@ -134,7 +140,7 @@ class RunMetadata:
     regions_excluded: List[str] = field(default_factory=list)
     auto_detected_regions: bool = False
     run_timestamp: str = ""
-    tool_version: str = "1.0.0"
+    tool_version: str = "2.0.0"
     pmapper_version: str = ""
     output_directory: str = ""
     output_formats: List[str] = field(default_factory=list)

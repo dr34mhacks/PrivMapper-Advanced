@@ -1,11 +1,12 @@
-"""Export findings and escalation paths to CSV (with CVSS, risk score, evidence)."""
+"""Export findings and escalation paths to CSV with risk and evidence fields."""
 
 import csv
+import json
 from pathlib import Path
 from typing import List
 
-from ..models import AccountAnalysis
-from ..knowledge import CVSS_VECTORS, get_exploitation_guidance
+from ..models import AccountAnalysis, Finding
+from ..knowledge import get_exploitation_guidance
 from ..remediation import RemediationEngine
 
 
@@ -16,8 +17,9 @@ class CSVExporter:
               "principal", "risk_score", "evidence", "impact", "remediation"]
 
     @staticmethod
-    def export(analyses: List[AccountAnalysis], output_path: Path):
-        """Export findings to CSV with assessment substance (CVSS, risk score, evidence)."""
+    def export(analyses: List[AccountAnalysis], output_path: Path,
+               cross_account_findings: List[Finding] = None):
+        """Export findings to CSV with assessment substance and evidence."""
         rows = []
 
         for analysis in analyses:
@@ -57,12 +59,35 @@ class CSVExporter:
                     "title": f"Escalation: {path.source.name} -> {path.target.name} ({path.technique})",
                     "severity": path.severity,
                     "category": "privesc",
-                    "cvss": CVSS_VECTORS.get("privesc", ""),
+                    "cvss": "",
                     "principal": path.source.arn,
                     "risk_score": path.risk_score,
-                    "evidence": chain,
-                    "impact": f"Can escalate to {path.target.name} via {path.technique}",
+                    "evidence": json.dumps({
+                        "chain": chain,
+                        "hops": path.hop_explanations,
+                        "evidence_status": path.evidence_status,
+                        "missing_prerequisites": path.missing_prerequisites,
+                        "validation_notes": path.validation_notes,
+                    }, separators=(",", ":")),
+                    "impact": path.resulting_access,
                     "remediation": RemediationEngine.get_path_remediation(path)["fix"],
+                })
+
+        for finding in cross_account_findings or []:
+            affected = finding.principals or ["multiple accounts"]
+            for principal in affected:
+                rows.append({
+                    "account_id": "multi-account",
+                    "finding_id": finding.id,
+                    "title": finding.title,
+                    "severity": finding.severity,
+                    "category": finding.category,
+                    "cvss": "",
+                    "principal": principal,
+                    "risk_score": "",
+                    "evidence": finding.description,
+                    "impact": finding.impact,
+                    "remediation": finding.remediation,
                 })
 
         if rows:

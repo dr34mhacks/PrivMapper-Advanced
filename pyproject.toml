@@ -41,4 +41,4 @@ Issues = "https://github.com/dr34mhacks/privmapper/issues"
 where = ["src"]
 
 [tool.setuptools.package-data]
-privmapper = ["py.typed"]
+privmapper = ["py.typed", "reporting/vendor/*.js", "reporting/vendor/fonts/*.ttf"]
