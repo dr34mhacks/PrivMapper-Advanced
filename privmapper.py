@@ -754,7 +754,7 @@ def resolve_managed_policy_actions(policy_arn: str) -> Optional[Set[str]]:
     can flag "managed policy body unavailable; capabilities may be understated".
     Returns an empty set only for policies we know grant no escalation-relevant power.
     """
-    if not policy_arn.startswith("arn:aws:iam::aws:policy/"):
+    if not re.match(r"^arn:[^:]+:iam::aws:policy/", policy_arn):
         return None
     name = policy_arn.split("/")[-1]
 
@@ -780,6 +780,64 @@ def warn(msg): print(f"{Colors.YELLOW}[!]{Colors.NC} {msg}")
 
 
 def err(msg): print(f"{Colors.RED}[-]{Colors.NC} {msg}")
+
+
+class SavedQueryOutputLoader:
+    """Read profile directories produced by the original PrivMapper script."""
+
+    def __init__(self, profile_path: Path):
+        self.profile_path = Path(profile_path)
+        self.stats_file = self.profile_path / "02_graph_stats.txt"
+
+    def validate(self) -> bool:
+        return self.stats_file.is_file() and any(
+            (self.profile_path / name).is_dir() for name in ("queries", "presets")
+        )
+
+    @staticmethod
+    def discover(path: Path) -> List[Path]:
+        path = Path(path)
+        if not path.is_dir():
+            return []
+        candidates = [path] if SavedQueryOutputLoader(path).validate() else []
+        candidates.extend(
+            stats.parent for stats in path.rglob("02_graph_stats.txt")
+            if SavedQueryOutputLoader(stats.parent).validate()
+        )
+        return list(dict.fromkeys(candidates))
+
+    @staticmethod
+    def _read_lines(path: Path) -> List[str]:
+        try:
+            return [line for line in path.read_text(errors="replace").splitlines()
+                    if line.strip() and not line.startswith("Query:") and line.strip() != "---"]
+        except OSError as ex:
+            raise ValueError(f"Could not read saved query file {path}: {ex}") from ex
+
+    def load(self) -> Tuple[Dict[str, List[str]], Dict[str, str]]:
+        if not self.validate():
+            raise ValueError(f"Not an original PrivMapper output profile: {self.profile_path}")
+        stats: Dict[str, str] = {}
+        for line in self._read_lines(self.stats_file):
+            if "Account" in line:
+                match = re.search(r"(\d{10,})", line)
+                if match:
+                    stats["account_id"] = match.group(1)
+            elif "Nodes" in line:
+                match = re.search(r"(\d+)\s*\((\d+)\s*admin", line, re.I)
+                if match:
+                    stats["nodes"], stats["admins"] = match.groups()
+            elif "Edges" in line:
+                match = re.search(r"(\d+)", line)
+                if match:
+                    stats["edges"] = match.group(1)
+        results: Dict[str, List[str]] = {}
+        for directory in ("presets", "queries"):
+            for query_file in sorted((self.profile_path / directory).glob("*.txt")):
+                lines = self._read_lines(query_file)
+                if lines:
+                    results[query_file.stem] = lines
+        return results, stats
 
 
 class GraphLoader:
@@ -1050,7 +1108,7 @@ class GraphLoader:
                              pol.get("policy_doc", pol.get("Document", {}))))
                 statements = self._parse_statements(doc)
 
-                is_aws = arn.startswith("arn:aws:iam::aws:") or any(
+                is_aws = bool(re.match(r"^arn:[^:]+:iam::aws:policy/", arn)) or any(
                     re.search(p, name) for p in AWS_MANAGED_PATTERNS
                 )
 
@@ -1597,7 +1655,7 @@ class AnalysisEngine:
                 return
             acts = resolve_managed_policy_actions(pa)
             if acts is None:
-                if pa.startswith("arn:aws:iam::aws:policy/") and pa not in principal.unresolved_managed:
+                if re.match(r"^arn:[^:]+:iam::aws:policy/", pa) and pa not in principal.unresolved_managed:
                     principal.unresolved_managed.append(pa)
                 return
             synth = Policy(
@@ -1930,7 +1988,7 @@ class AnalysisEngine:
         if path.source.principal_type == "role":
             if path.source.trust_policy:
                 trust_str = json.dumps(path.source.trust_policy)
-                if '"*"' in trust_str or "arn:aws:iam::" in trust_str:
+                if '"*"' in trust_str or re.search(r"arn:[^:]+:iam::", trust_str):
                     path.exposure += 2
 
         path.blast_radius = 10 if path.target.is_admin else 5
@@ -2231,6 +2289,19 @@ class AnalysisEngine:
                 if stmt.get("Effect") != "Allow":
                     continue
 
+                raw_actions = stmt.get("Action", [])
+                actions = [raw_actions] if isinstance(raw_actions, str) else raw_actions
+                raw_not_actions = stmt.get("NotAction", [])
+                not_actions = [raw_not_actions] if isinstance(raw_not_actions, str) else raw_not_actions
+
+                def allows_trust_action(requested: str) -> bool:
+                    requested = requested.lower()
+                    if not_actions:
+                        return not any(fnmatchcase(requested, str(pattern).lower())
+                                       for pattern in not_actions)
+                    return any(fnmatchcase(requested, str(pattern).lower())
+                               for pattern in (actions or []))
+
                 principals_field = stmt.get("Principal", {})
                 if isinstance(principals_field, str):
                     principals_field = {"AWS": [principals_field]}
@@ -2259,14 +2330,15 @@ class AnalysisEngine:
                 aws_principals = principals_field.get("AWS", [])
                 if isinstance(aws_principals, str):
                     aws_principals = [aws_principals]
+                if not allows_trust_action("sts:AssumeRole"):
+                    aws_principals = []
                 for trusted in aws_principals:
                     is_wildcard = trusted == "*"
                     trusted_account = ""
                     if not is_wildcard:
-                        if "arn:aws:iam::" in trusted or "arn:aws:sts::" in trusted:
-                            parts = trusted.split(":")
-                            if len(parts) > 4:
-                                trusted_account = parts[4]
+                        parts = trusted.split(":")
+                        if len(parts) > 4 and parts[0] == "arn" and parts[2] in {"iam", "sts"}:
+                            trusted_account = parts[4]
                         elif trusted.isdigit() and len(trusted) == 12:
                             trusted_account = trusted
                     if trusted_account and trusted_account == self.account_id and not is_wildcard:
@@ -2312,9 +2384,18 @@ class AnalysisEngine:
                     fed_principals = [fed_principals]
                 for fed in fed_principals:
                     fed_l = str(fed).lower()
-                    is_oidc = fed_l.startswith("arn:aws:iam::") and ":oidc-provider/" in fed_l
+                    is_oidc = fed_l.startswith("arn:") and ":iam::" in fed_l and ":oidc-provider/" in fed_l
                     is_github = "token.actions.githubusercontent.com" in fed_l
                     is_saml = ":saml-provider/" in fed_l
+                    if is_oidc and not allows_trust_action("sts:AssumeRoleWithWebIdentity"):
+                        continue
+                    if is_saml and not allows_trust_action("sts:AssumeRoleWithSAML"):
+                        continue
+                    if not is_oidc and not is_saml and not (
+                        allows_trust_action("sts:AssumeRoleWithWebIdentity") or
+                        allows_trust_action("sts:AssumeRoleWithSAML")
+                    ):
+                        continue
                     if is_github:
                         github_aud = bool(aud_values) and all(v == "sts.amazonaws.com" for v in aud_values)
                         if not has_sub and not github_aud:
@@ -2327,7 +2408,9 @@ class AnalysisEngine:
                             risk = "low"
                             reason = "GitHub Actions OIDC trust scoped to a specific repo/branch via sub"
                     elif is_oidc:
-                        risk = "high" if not (has_sub and has_aud) else "low"
+                        sub_is_scoped = has_sub and all(v not in {"*", "?"} for v in sub_values)
+                        aud_is_scoped = has_aud and all(v and "*" not in v and "?" not in v for v in aud_values)
+                        risk = "high" if not (sub_is_scoped and aud_is_scoped) else "low"
                         reason = ("OIDC federated trust without positive sub and aud constraints" if risk == "high"
                                   else "OIDC federated trust constrained by sub/aud")
                     elif is_saml:
@@ -2355,6 +2438,8 @@ class AnalysisEngine:
                 svc_principals = principals_field.get("Service", [])
                 if isinstance(svc_principals, str):
                     svc_principals = [svc_principals]
+                if not allows_trust_action("sts:AssumeRole"):
+                    svc_principals = []
                 for svc in svc_principals:
                     svc_prefix = str(svc).split(".")[0].lower()
                     if svc_prefix not in CONFUSED_DEPUTY_SERVICES:
@@ -2961,7 +3046,7 @@ class QueryResultsAnalyzer:
         if m:
             return m.group(1)
 
-        arn_match = re.search(r"(arn:aws:iam::\d+:(user|role|group)/[\w\-\.@+=]+)", line)
+        arn_match = re.search(r"(arn:[^:]+:iam::\d+:(user|role|group)/[\w\-\.@+=/]+)", line)
         if arn_match:
             return arn_match.group(1)
 
@@ -3176,8 +3261,9 @@ class QueryEngine:
         if not principal.trust_policy:
             return False
         trust_str = json.dumps(principal.trust_policy)
-        if re.search(r'arn:aws:iam::(?!{})'.format(principal.account_id), trust_str):
-            return True
+        for account_id in re.findall(r'arn:[^:]+:iam::(\d{12}):', trust_str):
+            if account_id != principal.account_id:
+                return True
         if '"*"' in trust_str:
             return True
         return False
@@ -3321,7 +3407,9 @@ class QueryEngine:
             return False
         if principal.permissions_boundary:
             boundary = self.analysis.policies.get(principal.permissions_boundary)
-            if boundary and not self._policy_set_allows([boundary], action, resource):
+            if boundary is None:
+                return False
+            if not self._policy_set_allows([boundary], action, resource):
                 return False
         return True
 
@@ -6717,7 +6805,7 @@ class HTMLExporter:
             escaped = re.sub(r'(\s)(--[a-zA-Z][a-zA-Z0-9-]*)(\s|=|$)', r'\1<span class="flag">\2</span>\3', escaped)
             escaped = re.sub(r'(\s)(-[a-zA-Z])(\s)', r'\1<span class="flag">\2</span>\3', escaped)
 
-            escaped = re.sub(r'(arn:aws:[a-z0-9:/_-]+)', r'<span class="arn">\1</span>', escaped)
+            escaped = re.sub(r'(arn:[a-z0-9-]+:[a-z0-9:/_.+=,@*-]+)', r'<span class="arn">\1</span>', escaped)
 
             escaped = re.sub(r'(&lt;[A-Z][A-Z0-9_]*&gt;)', r'<span class="var">\1</span>', escaped)
 
@@ -6888,6 +6976,118 @@ class CSVExporter:
             print("[!] No findings to export to CSV")
 
 
+def _analysis_from_query_results(results, stats, alias):
+    """Build a reduced-evidence analysis from saved PMapper text queries."""
+    analyzer = QueryResultsAnalyzer(results, stats)
+    capabilities = analyzer.build_principal_capabilities()
+    raw_paths = analyzer.get_privesc_paths()
+    shadow_refs = analyzer.get_shadow_admins()
+    admin_refs = analyzer.get_admins()
+    account_id = stats.get("account_id", "unknown")
+
+    def canonical(ref):
+        if not ref:
+            return ""
+        if ref.startswith("arn:") or account_id == "unknown":
+            return ref
+        if re.match(r"^(user|role|group)/", ref):
+            return f"arn:aws:iam::{account_id}:{ref}"
+        return ref
+
+    all_refs = set(capabilities) | set(shadow_refs) | set(admin_refs)
+    for path in raw_paths:
+        all_refs.update(x for x in (path.get("source"), path.get("target")) if x)
+    principals, refs = {}, {}
+    for ref in all_refs:
+        arn = canonical(ref)
+        refs[ref] = arn
+        resource = arn.split(":", 5)[-1] if arn.startswith("arn:") else ref
+        ptype = resource.split("/", 1)[0] if "/" in resource else "unknown"
+        actions = set(capabilities.get(ref, set()))
+        principals[arn] = Principal(
+            arn=arn, name=resource.split("/")[-1], principal_type=ptype,
+            account_id=account_id, is_admin=ref in admin_refs,
+            dangerous_actions=actions,
+            capabilities=[CHECK_LABEL.get(action, action) for action in sorted(actions)],
+        )
+
+    shadows = [principals[refs[ref]] for ref in shadow_refs if refs.get(ref) in principals]
+    overly = []
+    for ref, actions in capabilities.items():
+        if ref in admin_refs or ref in shadow_refs or len(actions) < 3:
+            continue
+        if any(re.search(pattern, ref) for pattern in AWS_MANAGED_PATTERNS):
+            continue
+        overly.append(principals[refs[ref]])
+
+    paths = []
+    for raw in raw_paths:
+        source = principals.get(refs.get(raw.get("source", ""), ""))
+        target = principals.get(refs.get(raw.get("target", ""), ""))
+        if not source or not target:
+            continue
+        reason = " ".join(raw.get("hops", [])) or raw.get("raw_line", "")
+        edge = Edge(source.arn, target.arn, reason, reason[:100])
+        paths.append(EscalationPath(
+            source=source, target=target, hops=[edge], technique="PMapper saved query",
+            risk_score=70, severity="high", complexity=8, exposure=5,
+            blast_radius=10, attack_narrative=reason,
+            resulting_access=f"Administrative access through {target.name}",
+            validation_notes=["Derived from saved PMapper text output; graph and policy documents were not included."],
+            evidence_status="saved-query-evidence",
+        ))
+
+    findings = []
+    non_managed_admins = [refs[ref] for ref in admin_refs
+                          if not any(re.search(pattern, ref) for pattern in AWS_MANAGED_PATTERNS)]
+    if non_managed_admins:
+        findings.append(Finding(
+            id=f"{account_id}_admin_access", title="Principals with Administrator Access",
+            severity="critical", category="iam",
+            description="Saved PMapper output identifies these principals as administrative.",
+            principals=non_managed_admins,
+            impact="Compromise of any of these credentials may result in full account takeover.",
+            remediation="Review each admin principal and remove unnecessary administrative access.",
+        ))
+    if shadows:
+        findings.append(Finding(
+            id=f"{account_id}_shadow_admin", title="Shadow Administrators",
+            severity="critical", category="iam",
+            description="Saved PMapper output identifies these principals as shadow administrators.",
+            principals=[p.arn for p in shadows],
+            impact="These principals may be able to obtain administrative access.",
+            remediation="Validate the PMapper path and remove the enabling permissions.",
+        ))
+    if overly:
+        findings.append(Finding(
+            id=f"{account_id}_overly_permissive", title="Overly Permissive IAM Principals",
+            severity="high", category="iam",
+            description="Saved action-query results show multiple dangerous capabilities.",
+            principals=[p.arn for p in overly[:20]],
+            impact="Credential compromise has an increased blast radius.",
+            remediation="Review saved query evidence and apply least privilege.",
+        ))
+    if raw_paths:
+        findings.append(Finding(
+            id=f"{account_id}_privesc", title=f"Privilege Escalation Paths ({len(raw_paths)} found)",
+            severity="critical", category="privesc",
+            description="PMapper's saved preset output identifies routes to administrative access.",
+            principals=sorted({canonical(path.get("source", "")) for path in raw_paths if path.get("source")}),
+            impact="Successful traversal may result in account takeover.",
+            remediation="Validate each saved path against current IAM policy and remove its prerequisites.",
+            details={"paths": raw_paths, "source_format": "original-privmapper-text-output"},
+        ))
+
+    return AccountAnalysis(
+        account_id=account_id, account_alias=alias,
+        node_count=int(stats.get("nodes", len(principals))),
+        edge_count=int(stats.get("edges", 0)), admin_count=int(stats.get("admins", len(admin_refs))),
+        principals=principals, edges=[hop for path in paths for hop in path.hops], policies={},
+        findings=findings, escalation_paths=paths, shadow_admins=shadows,
+        overly_permissive=overly,
+    )
+
+
 def main():
     parser = argparse.ArgumentParser(
         description=("Evidence-backed AWS IAM graph analysis and reporting. "
@@ -6959,7 +7159,7 @@ Examples:
         action="append",
         dest="inputs",
         metavar="PATH",
-        help="Path to pmapper graph directory (can specify multiple)",
+        help="Path to a PMapper graph or original PrivMapper output directory (repeatable)",
     )
 
     parser.add_argument(
@@ -6969,7 +7169,7 @@ Examples:
     )
     parser.add_argument(
         "--format", "-f",
-        default="html",
+        default=None,
         help="Output formats: html,json,csv (comma-separated) or all (default: html)",
     )
     parser.add_argument(
@@ -7021,6 +7221,9 @@ Examples:
         return 0
 
     args = parser.parse_args()
+
+    format_explicit = args.format is not None
+    args.format = args.format or "html"
 
     profile_values = list(args.profiles or [])
     for group in args.profile_groups or []:
@@ -7272,41 +7475,46 @@ Examples:
 
         if args.inputs:
             for p in args.inputs:
-                path = Path(p)
+                path = Path(p).expanduser()
                 if path.exists():
-                    if (path / "nodes.json").exists():
+                    if path.is_file() and path.name == "nodes.json" and (path.parent / "edges.json").is_file():
+                        input_paths.append(path.parent)
+                    elif path.is_dir() and (path / "nodes.json").is_file() and (path / "edges.json").is_file():
                         input_paths.append(path)
-                    elif (path / "graph" / "nodes.json").exists():
+                    elif path.is_dir() and (path / "graph" / "nodes.json").is_file() and (path / "graph" / "edges.json").is_file():
                         input_paths.append(path / "graph")
+                    elif path.is_dir():
+                        discovered = [nodes.parent for nodes in path.rglob("nodes.json")
+                                      if (nodes.parent / "edges.json").is_file()]
+                        discovered.extend(SavedQueryOutputLoader.discover(path))
+                        if discovered:
+                            input_paths.extend(discovered)
+                        else:
+                            print(f"[!] No graph data found under: {p}")
                     else:
-                        for subdir in path.iterdir():
-                            if subdir.is_dir():
-                                if (subdir / "nodes.json").exists():
-                                    input_paths.append(subdir)
-                                elif (subdir / "graph" / "nodes.json").exists():
-                                    input_paths.append(subdir / "graph")
+                        print(f"[!] Expected a graph directory or nodes.json file: {p}")
                 else:
                     print(f"[!] Path not found: {p}")
 
-        if args.auto_detect or not input_paths:
+        if args.auto_detect:
             detected = find_pmapper_graphs()
             if detected:
                 print(f"[*] Auto-detected {len(detected)} pmapper graph(s)")
                 input_paths.extend(detected)
 
         if not input_paths:
-            print("[!] No pmapper graph data found.")
-            print("    Use --profile to run pmapper, or --input to specify graph data")
-            print("    Example: python privmapper_advanced.py --profile my-aws-profile")
-            print("    Example: python privmapper_advanced.py --input /path/to/graph/")
+            print("[!] No PMapper graph or saved PrivMapper query output found.")
+            print("    Use --profile to run pmapper, or --input to specify collected data")
+            print("    Example: python privmapper.py --profile my-aws-profile")
+            print("    Example: python privmapper.py --input /path/to/graph/")
             sys.exit(1)
 
         input_paths = list(dict.fromkeys(input_paths))
 
         print(f"\n{'='*60}")
         print("  PrivMapper Advanced - IAM Security Analysis")
-        print("  Mode: Read Existing Graph Data")
-        print(f"  Analyzing {len(input_paths)} graph(s)")
+        print("  Mode: Read Existing PMapper/PrivMapper Data")
+        print(f"  Analyzing {len(input_paths)} input source(s)")
         print(f"{'='*60}\n")
 
         for graph_path in input_paths:
@@ -7314,7 +7522,19 @@ Examples:
 
             loader = GraphLoader(graph_path)
             if not loader.validate():
-                print(f"[!] Invalid graph directory: {graph_path}")
+                saved_loader = SavedQueryOutputLoader(graph_path)
+                if not saved_loader.validate():
+                    print(f"[!] Unsupported input directory: {graph_path}")
+                    continue
+                try:
+                    results, stats = saved_loader.load()
+                    analysis = _analysis_from_query_results(results, stats, graph_path.name)
+                except ValueError as ex:
+                    print(f"[!] Could not load saved PrivMapper output {graph_path}: {ex}")
+                    continue
+                analyses.append(analysis)
+                print(f"    Loaded original PrivMapper text output: {len(results)} saved queries")
+                print(f"    Found {len(analysis.findings)} findings, {len(analysis.escalation_paths)} escalation paths")
                 continue
 
             try:
@@ -7349,7 +7569,7 @@ Examples:
                 results = query_engine.run_preset(args.preset)
                 query_engine.print_results(results, preset_info.get("name", args.preset))
 
-        if not args.format or args.format == "html":
+        if not format_explicit:
             print("\n[*] Query complete. Use --format to also generate a full report.")
             sys.exit(0)
 
